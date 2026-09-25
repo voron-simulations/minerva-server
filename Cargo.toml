@@ -1,0 +1,48 @@
+[workspace]
+members = ["."]
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+criterion = "0.7"
+parking_lot = "0.12"
+prost = "0.14"
+tokio = "1"
+tokio-stream = { version = "0.1", features = ["sync", "net"] }
+tonic = "0.14"
+tonic-prost = "0.14"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[package]
+name = "minerva-server"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Minerva gRPC server library: state cache and command dispatch for simulation engine plugins"
+repository = "https://github.com/voron-simulations/minerva-server"
+
+[lib]
+name = "minerva_server"
+bench = false
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+prost = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+tokio-stream = { workspace = true }
+tonic = { workspace = true, features = ["transport", "codegen"] }
+tonic-prost = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+tonic = { workspace = true, features = ["router"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+[[bench]]
+name = "state"
+harness = false

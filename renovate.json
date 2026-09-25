@@ -1,0 +1,3 @@
+{
+  "extends": ["github>voron-software/.github:renovate.json5"]
+}

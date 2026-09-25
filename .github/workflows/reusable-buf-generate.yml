@@ -1,0 +1,31 @@
+name: Buf generate
+
+on:
+  workflow_call:
+
+jobs:
+  buf-generate:
+    name: No diff
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup buf
+        uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
+
+      - name: Generate
+        run: buf generate
+
+      # `git diff` alone only compares tracked paths against the index, so
+      # it stays green if generation adds an entirely new (untracked) file
+      # -- e.g. a new proto file's package. `git status --porcelain` catches
+      # untracked paths too.
+      - name: Fail on diff
+        run: |
+          git status --porcelain -- src/gen
+          test -z "$(git status --porcelain -- src/gen)"
