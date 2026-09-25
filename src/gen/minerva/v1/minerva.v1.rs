@@ -363,12 +363,19 @@ pub struct Weather {
     #[prost(float, tag="3")]
     pub wind_direction: f32,
 }
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct WorldSize {
+    #[prost(double, tag="1")]
+    pub x_meters: f64,
+    #[prost(double, tag="2")]
+    pub y_meters: f64,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SimulationInfo {
     #[prost(string, tag="1")]
     pub world_name: ::prost::alloc::string::String,
-    #[prost(double, repeated, tag="2")]
-    pub world_size: ::prost::alloc::vec::Vec<f64>,
+    #[prost(message, optional, tag="2")]
+    pub world_size: ::core::option::Option<WorldSize>,
     #[prost(message, repeated, tag="3")]
     pub factions: ::prost::alloc::vec::Vec<Faction>,
     /// in-simulation time at scenario start (unix timestamp)
