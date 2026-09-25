@@ -60,6 +60,21 @@ impl fmt::Display for CommandId {
     }
 }
 
+impl From<u64> for CommandId {
+    /// Reconstructs a [`CommandId`] engines received from [`crate::CommandSink::dispatch`]
+    /// (e.g. round-tripped through an engine-side callback) so it can be
+    /// passed back to [`crate::Dispatcher::complete`].
+    fn from(id: u64) -> Self {
+        Self(id)
+    }
+}
+
+impl From<CommandId> for u64 {
+    fn from(id: CommandId) -> Self {
+        id.0
+    }
+}
+
 /// Monotonic allocator for [`CommandId`]s, owned by [`crate::Dispatcher`].
 #[derive(Debug, Default)]
 pub(crate) struct CommandIdAllocator(AtomicU64);
@@ -67,5 +82,24 @@ pub(crate) struct CommandIdAllocator(AtomicU64);
 impl CommandIdAllocator {
     pub(crate) fn next(&self) -> CommandId {
         CommandId(self.0.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_id_round_trips_through_u64() {
+        let allocator = CommandIdAllocator::default();
+        let id = allocator.next();
+        let raw: u64 = id.into();
+        assert_eq!(CommandId::from(raw), id);
+    }
+
+    #[test]
+    fn allocator_hands_out_distinct_ids() {
+        let allocator = CommandIdAllocator::default();
+        assert_ne!(allocator.next(), allocator.next());
     }
 }
