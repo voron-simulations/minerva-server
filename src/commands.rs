@@ -1,8 +1,9 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::Mutex;
+use parking_lot::ReentrantMutex;
 use tokio::sync::oneshot;
 use tonic::Status;
 
@@ -104,6 +105,9 @@ impl Command {
                 if c.supported_group_id.is_empty() {
                     return Err(Status::invalid_argument("supported_group_id is required"));
                 }
+                if c.support_type.is_empty() {
+                    return Err(Status::invalid_argument("support_type is required"));
+                }
                 Ok(Command::Support {
                     supporter_group_id: require_group_id(c.supporter_group_id)?,
                     supported_group_id: c.supported_group_id.into(),
@@ -130,13 +134,20 @@ pub trait CommandSink: Send + Sync {
     fn dispatch(&self, id: CommandId, command: &Command);
 }
 
+type Pending = ReentrantMutex<RefCell<HashMap<CommandId, oneshot::Sender<CommandOutcome>>>>;
+
 /// Tracks commands sent to the engine until they are acknowledged. Owns the
 /// single [`CommandSink`] commands are dispatched through.
 pub struct Dispatcher {
     sink: Arc<dyn CommandSink>,
     timeout: Duration,
     ids: CommandIdAllocator,
-    pending: Mutex<HashMap<CommandId, oneshot::Sender<CommandOutcome>>>,
+    // A *reentrant* mutex, deliberately: `send()` holds this across the call
+    // to `sink.dispatch()`, and a `CommandSink` that acknowledges
+    // synchronously (calling back into `complete()`/`cancel_all()` from
+    // the same thread, inside `dispatch()`) needs that reentrant call to
+    // succeed rather than deadlock on a lock its own caller already holds.
+    pending: Pending,
 }
 
 impl Dispatcher {
@@ -145,7 +156,7 @@ impl Dispatcher {
             sink,
             timeout,
             ids: CommandIdAllocator::default(),
-            pending: Mutex::new(HashMap::new()),
+            pending: ReentrantMutex::new(RefCell::new(HashMap::new())),
         }
     }
 
@@ -162,8 +173,8 @@ impl Dispatcher {
             // it's inserted but before the engine was actually told about
             // it, which would leave the caller and the engine disagreeing
             // about whether the command happened.
-            let mut pending = self.pending.lock();
-            pending.insert(id, tx);
+            let pending = self.pending.lock();
+            pending.borrow_mut().insert(id, tx);
             self.sink.dispatch(id, &command);
         }
         // Removes `id` from `pending` on every exit from here on, including
@@ -185,7 +196,7 @@ impl Dispatcher {
     /// Acknowledges a previously dispatched command. Returns `false` if `id`
     /// is not (or no longer) pending, e.g. it already timed out.
     pub fn complete(&self, id: CommandId, outcome: CommandOutcome) -> bool {
-        match self.pending.lock().remove(&id) {
+        match self.pending.lock().borrow_mut().remove(&id) {
             Some(tx) => {
                 let _ = tx.send(outcome);
                 true
@@ -196,7 +207,7 @@ impl Dispatcher {
 
     /// Fails every pending command, e.g. on a simulation reset.
     pub fn cancel_all(&self) {
-        for (_, tx) in self.pending.lock().drain() {
+        for (_, tx) in self.pending.lock().borrow_mut().drain() {
             let _ = tx.send(CommandOutcome::Failure("cancelled".to_string()));
         }
     }
@@ -206,18 +217,20 @@ impl Dispatcher {
 /// future stopped running (completed normally, timed out, or was dropped
 /// before either happened).
 struct RemovePending<'a> {
-    pending: &'a Mutex<HashMap<CommandId, oneshot::Sender<CommandOutcome>>>,
+    pending: &'a Pending,
     id: CommandId,
 }
 
 impl Drop for RemovePending<'_> {
     fn drop(&mut self) {
-        self.pending.lock().remove(&self.id);
+        self.pending.lock().borrow_mut().remove(&self.id);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use parking_lot::Mutex;
+
     use super::*;
 
     fn move_command(group_id: &str) -> Command {
@@ -254,6 +267,21 @@ mod tests {
             proto::MoveCommand {
                 position: Some(proto::Position::default()),
                 group_id: String::new(),
+            },
+        ));
+        assert_eq!(
+            expect_err(Command::from_proto(request)).code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn from_proto_rejects_empty_support_type() {
+        let request = oneof(proto::send_command_request::Command::Support(
+            proto::SupportCommand {
+                supporter_group_id: "g1".to_string(),
+                supported_group_id: "g2".to_string(),
+                support_type: String::new(),
             },
         ));
         assert_eq!(
@@ -339,6 +367,40 @@ mod tests {
         }
     }
 
+    /// Acknowledges every command synchronously, from inside `dispatch()`
+    /// itself -- the scenario that deadlocked before `pending` became a
+    /// `ReentrantMutex`: `complete()` needs the same lock `send()` was
+    /// still holding while calling this.
+    struct SynchronousAckSink {
+        dispatcher: std::sync::OnceLock<std::sync::Weak<Dispatcher>>,
+    }
+    impl CommandSink for SynchronousAckSink {
+        fn dispatch(&self, id: CommandId, _command: &Command) {
+            if let Some(dispatcher) = self.dispatcher.get().and_then(std::sync::Weak::upgrade) {
+                dispatcher.complete(id, CommandOutcome::Success);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn send_does_not_deadlock_on_a_synchronously_acking_sink() {
+        let sink = Arc::new(SynchronousAckSink {
+            dispatcher: std::sync::OnceLock::new(),
+        });
+        let dispatcher = Arc::new(Dispatcher::new(sink.clone(), Duration::from_secs(5)));
+        let _ = sink.dispatcher.set(Arc::downgrade(&dispatcher));
+
+        // A generous, test-only timeout distinct from the Dispatcher's own:
+        // if the reentrant lock regresses, this fails the test instead of
+        // hanging the whole suite.
+        match tokio::time::timeout(Duration::from_secs(2), dispatcher.send(move_command("g1")))
+            .await
+        {
+            Ok(outcome) => assert_eq!(outcome, CommandOutcome::Success),
+            Err(_) => panic!("send() deadlocked (or took far too long) on a synchronous ack"),
+        }
+    }
+
     #[tokio::test]
     async fn send_resolves_on_complete() {
         let (id_tx, id_rx) = oneshot::channel();
@@ -403,11 +465,11 @@ mod tests {
         if id_rx.await.is_err() {
             panic!("sink was never invoked");
         }
-        assert_eq!(dispatcher.pending.lock().len(), 1);
+        assert_eq!(dispatcher.pending.lock().borrow().len(), 1);
 
         handle.abort();
         let _ = handle.await;
-        assert_eq!(dispatcher.pending.lock().len(), 0);
+        assert_eq!(dispatcher.pending.lock().borrow().len(), 0);
     }
 
     #[tokio::test]
