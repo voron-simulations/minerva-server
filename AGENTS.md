@@ -15,7 +15,7 @@
 buf generate
 ```
 
-`buf.gen.yaml` currently points `inputs` at a local `../minerva-protocol` checkout (branch `feat/buf-v1`) because the [minerva-protocol](https://github.com/voron-simulations/minerva-protocol) BSR module has no commits yet. Once that PR merges and BSR has a commit, switch the input to `module: buf.build/voron-simulations/minerva:<commit>` and update `.github/workflows/reusable-buf-generate.yml` to drop the sibling checkout. Commit the diff in `src/gen/` after regenerating.
+`buf.gen.yaml`'s `inputs` pins a specific [BSR](https://buf.build/voron-simulations/minerva) commit rather than tracking `main`, so a protocol change only takes effect here once you deliberately bump it. To pick up a new protocol commit: bump the `module:` ref in `buf.gen.yaml`, regenerate, and commit the diff in `src/gen/`.
 
 ## Testing
 
