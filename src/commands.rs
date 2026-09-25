@@ -61,17 +61,23 @@ impl Command {
         let require_position = |position: Option<proto::Position>| {
             position.ok_or_else(|| Status::invalid_argument("position is required"))
         };
+        let require_group_id = |group_id: String| -> Result<GroupId, Status> {
+            if group_id.is_empty() {
+                return Err(Status::invalid_argument("group_id is required"));
+            }
+            Ok(group_id.into())
+        };
 
         match request
             .command
             .ok_or_else(|| Status::invalid_argument("command is required"))?
         {
             Oneof::Move(c) => Ok(Command::Move {
-                group_id: c.group_id.into(),
+                group_id: require_group_id(c.group_id)?,
                 position: require_position(c.position)?,
             }),
             Oneof::SearchAndDestroy(c) => Ok(Command::SearchAndDestroy {
-                group_id: c.group_id.into(),
+                group_id: require_group_id(c.group_id)?,
                 position: require_position(c.position)?,
             }),
             Oneof::DefendZone(c) => {
@@ -79,7 +85,7 @@ impl Command {
                     return Err(Status::invalid_argument("zone_id is required"));
                 }
                 Ok(Command::DefendZone {
-                    group_id: c.group_id.into(),
+                    group_id: require_group_id(c.group_id)?,
                     zone_id: c.zone_id,
                     position: c.position,
                 })
@@ -89,7 +95,7 @@ impl Command {
                     return Err(Status::invalid_argument("waypoints must not be empty"));
                 }
                 Ok(Command::Patrol {
-                    group_id: c.group_id.into(),
+                    group_id: require_group_id(c.group_id)?,
                     waypoints: c.waypoints,
                     loop_: c.r#loop,
                 })
@@ -99,7 +105,7 @@ impl Command {
                     return Err(Status::invalid_argument("supported_group_id is required"));
                 }
                 Ok(Command::Support {
-                    supporter_group_id: c.supporter_group_id.into(),
+                    supporter_group_id: require_group_id(c.supporter_group_id)?,
                     supported_group_id: c.supported_group_id.into(),
                     support_type: c.support_type,
                 })
@@ -148,18 +154,31 @@ impl Dispatcher {
     pub async fn send(&self, command: Command) -> CommandOutcome {
         let id = self.ids.next();
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().insert(id, tx);
-
-        self.sink.dispatch(id, &command);
+        {
+            // insert() and dispatch() share this critical section with
+            // cancel_all()'s drain, so the two are strictly ordered rather
+            // than interleaved: cancel_all() can no longer remove this
+            // entry (reporting "cancelled" to our caller) in the gap after
+            // it's inserted but before the engine was actually told about
+            // it, which would leave the caller and the engine disagreeing
+            // about whether the command happened.
+            let mut pending = self.pending.lock();
+            pending.insert(id, tx);
+            self.sink.dispatch(id, &command);
+        }
+        // Removes `id` from `pending` on every exit from here on, including
+        // this future being dropped before completing (e.g. the gRPC caller
+        // disconnected) -- not just the timeout path below.
+        let _guard = RemovePending {
+            pending: &self.pending,
+            id,
+        };
 
         match tokio::time::timeout(self.timeout, rx).await {
             Ok(Ok(outcome)) => outcome,
             // Sender was dropped without completing, e.g. via cancel_all().
             Ok(Err(_)) => CommandOutcome::Failure("cancelled".to_string()),
-            Err(_) => {
-                self.pending.lock().remove(&id);
-                CommandOutcome::Failure("timeout".to_string())
-            }
+            Err(_) => CommandOutcome::Failure("timeout".to_string()),
         }
     }
 
@@ -180,6 +199,20 @@ impl Dispatcher {
         for (_, tx) in self.pending.lock().drain() {
             let _ = tx.send(CommandOutcome::Failure("cancelled".to_string()));
         }
+    }
+}
+
+/// Removes `id` from `pending` when dropped, regardless of why `send()`'s
+/// future stopped running (completed normally, timed out, or was dropped
+/// before either happened).
+struct RemovePending<'a> {
+    pending: &'a Mutex<HashMap<CommandId, oneshot::Sender<CommandOutcome>>>,
+    id: CommandId,
+}
+
+impl Drop for RemovePending<'_> {
+    fn drop(&mut self) {
+        self.pending.lock().remove(&self.id);
     }
 }
 
@@ -213,6 +246,20 @@ mod tests {
             command: None,
         }));
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn from_proto_rejects_empty_group_id() {
+        let request = oneof(proto::send_command_request::Command::Move(
+            proto::MoveCommand {
+                position: Some(proto::Position::default()),
+                group_id: String::new(),
+            },
+        ));
+        assert_eq!(
+            expect_err(Command::from_proto(request)).code(),
+            tonic::Code::InvalidArgument
+        );
     }
 
     #[test]
@@ -339,6 +386,28 @@ mod tests {
     fn complete_unknown_id_returns_false() {
         let dispatcher = Dispatcher::new(Arc::new(NoopSink), Duration::from_secs(5));
         assert!(!dispatcher.complete(CommandId(0), CommandOutcome::Success));
+    }
+
+    #[tokio::test]
+    async fn send_removes_pending_entry_if_dropped_before_completion() {
+        let (id_tx, id_rx) = oneshot::channel();
+        let sink = Arc::new(NotifyingSink {
+            id_tx: Mutex::new(Some(id_tx)),
+        });
+        let dispatcher = Arc::new(Dispatcher::new(sink, Duration::from_secs(5)));
+
+        let d = dispatcher.clone();
+        let handle = tokio::spawn(async move { d.send(move_command("g1")).await });
+        // Wait for dispatch() to run, so we know the entry was inserted
+        // before we cancel the future that's awaiting its ack.
+        if id_rx.await.is_err() {
+            panic!("sink was never invoked");
+        }
+        assert_eq!(dispatcher.pending.lock().len(), 1);
+
+        handle.abort();
+        let _ = handle.await;
+        assert_eq!(dispatcher.pending.lock().len(), 0);
     }
 
     #[tokio::test]

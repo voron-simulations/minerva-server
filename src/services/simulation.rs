@@ -42,8 +42,10 @@ impl proto::simulation_service_server::SimulationService for SimulationServiceIm
         &self,
         _request: Request<proto::SubscribeSimulationUpdatesRequest>,
     ) -> Result<Response<Self::SubscribeSimulationUpdatesStream>, Status> {
-        let snapshot = self.state.simulation_state();
+        // Subscribe before reading the snapshot: an update that lands in
+        // between would otherwise be missed by both.
         let updates = self.state.subscribe_simulation_updates();
+        let snapshot = self.state.simulation_state();
 
         let (tx, rx) = mpsc::channel(SUBSCRIBER_CHANNEL_CAPACITY);
         tokio::spawn(forward_simulation_updates(snapshot, updates, tx));
@@ -68,14 +70,20 @@ async fn forward_simulation_updates(
     }
 
     loop {
-        match updates.recv().await {
-            Ok(update) => {
-                if tx.send(Ok(update)).await.is_err() {
-                    return;
+        // Without racing `tx.closed()` here, a disconnected client's task
+        // (and its broadcast::Receiver) would linger until the next
+        // simulation update happened to occur.
+        tokio::select! {
+            () = tx.closed() => return,
+            update = updates.recv() => match update {
+                Ok(update) => {
+                    if tx.send(Ok(update)).await.is_err() {
+                        return;
+                    }
                 }
-            }
-            Err(broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(broadcast::error::RecvError::Closed) => return,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return,
+            },
         }
     }
 }

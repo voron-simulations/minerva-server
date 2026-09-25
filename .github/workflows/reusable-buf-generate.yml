@@ -21,5 +21,11 @@ jobs:
       - name: Generate
         run: buf generate
 
+      # `git diff` alone only compares tracked paths against the index, so
+      # it stays green if generation adds an entirely new (untracked) file
+      # -- e.g. a new proto file's package. `git status --porcelain` catches
+      # untracked paths too.
       - name: Fail on diff
-        run: git diff --exit-code -- src/gen
+        run: |
+          git status --porcelain -- src/gen
+          test -z "$(git status --porcelain -- src/gen)"

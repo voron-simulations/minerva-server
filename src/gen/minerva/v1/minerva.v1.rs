@@ -266,8 +266,23 @@ pub struct SubscribeGroupUpdatesRequest {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SubscribeGroupUpdatesResponse {
-    #[prost(message, optional, tag="1")]
-    pub group: ::core::option::Option<Group>,
+    #[prost(oneof="subscribe_group_updates_response::Event", tags="1, 2")]
+    pub event: ::core::option::Option<subscribe_group_updates_response::Event>,
+}
+/// Nested message and enum types in `SubscribeGroupUpdatesResponse`.
+pub mod subscribe_group_updates_response {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Event {
+        /// The group was created or changed (including no longer matching this
+        /// subscription's side filter as of a side change -- treat the same as
+        /// removed).
+        #[prost(message, tag="1")]
+        Upserted(super::Group),
+        /// The group with this id was removed (or stopped matching this
+        /// subscription's side filter).
+        #[prost(string, tag="2")]
+        RemovedId(::prost::alloc::string::String),
+    }
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Weapon {

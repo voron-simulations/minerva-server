@@ -76,13 +76,19 @@ async fn serve_on(
 /// `shutdown` resolves. For embedding into an application that already owns
 /// a tokio runtime; engine plugins normally use [`ServerHandle::spawn`]
 /// instead, which owns its own runtime and thread.
+///
+/// Takes `dispatcher` already built (rather than a [`ServerConfig`] plus a
+/// [`CommandSink`]) so an embedder can keep its own handle to it — e.g. to
+/// call [`Dispatcher::cancel_all`] independently of the server. That also
+/// means its `command_timeout` was already fixed at construction; there is
+/// no `ServerConfig` here for that setting to silently not apply to.
 pub async fn serve(
-    config: ServerConfig,
+    addr: SocketAddr,
     state: Arc<StateCache>,
     dispatcher: Arc<Dispatcher>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(config.addr).await?;
+    let listener = TcpListener::bind(addr).await?;
     serve_on(listener, state, dispatcher, shutdown).await
 }
 

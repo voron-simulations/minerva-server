@@ -12,14 +12,15 @@ use minerva_server::proto::group_service_client::GroupServiceClient;
 use minerva_server::proto::location_service_client::LocationServiceClient;
 use minerva_server::proto::send_command_request::Command as CommandOneof;
 use minerva_server::proto::simulation_service_client::SimulationServiceClient;
+use minerva_server::proto::subscribe_group_updates_response::Event as GroupEvent;
 use minerva_server::proto::unit_service_client::UnitServiceClient;
 use minerva_server::proto::{
     CommandResult, GetSimulationInfoRequest, GetUnitRequest, Group, ListGroupsRequest,
     ListLocationsRequest, ListUnitsRequest, Location, MoveCommand, Position, SendCommandRequest,
     Side, SimulationInfo, SimulationStateUpdate, SubscribeGroupUpdatesRequest,
-    SubscribeSimulationUpdatesRequest, Unit, UnitState,
+    SubscribeGroupUpdatesResponse, SubscribeSimulationUpdatesRequest, Unit, UnitState,
 };
-use minerva_server::{Command, CommandId, CommandSink, ServerConfig, ServerHandle};
+use minerva_server::{Command, CommandId, CommandSink, GroupId, ServerConfig, ServerHandle};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
@@ -34,6 +35,20 @@ fn expect_some<T>(value: Option<T>) -> T {
     match value {
         Some(value) => value,
         None => panic!("expected Some, got None"),
+    }
+}
+
+fn upserted_id(response: SubscribeGroupUpdatesResponse) -> Option<String> {
+    match response.event {
+        Some(GroupEvent::Upserted(group)) => Some(group.id),
+        _ => None,
+    }
+}
+
+fn removed_id(response: SubscribeGroupUpdatesResponse) -> Option<String> {
+    match response.event {
+        Some(GroupEvent::RemovedId(id)) => Some(id),
+        _ => None,
     }
 }
 
@@ -167,14 +182,16 @@ async fn subscribe_group_updates_yields_snapshot_then_update() {
     )
     .into_inner();
 
-    let snapshot = expect_some(stream.next().await);
-    let snapshot = expect(snapshot);
-    assert_eq!(snapshot.group.map(|g| g.id), Some("g1".to_string()));
+    let snapshot = expect(expect_some(stream.next().await));
+    assert_eq!(upserted_id(snapshot), Some("g1".to_string()));
 
     handle.state().upsert_group(a_group("g2", Side::Opfor));
-    let update = expect_some(stream.next().await);
-    let update = expect(update);
-    assert_eq!(update.group.map(|g| g.id), Some("g2".to_string()));
+    let update = expect(expect_some(stream.next().await));
+    assert_eq!(upserted_id(update), Some("g2".to_string()));
+
+    handle.state().remove_group(&GroupId::from("g1"));
+    let removal = expect(expect_some(stream.next().await));
+    assert_eq!(removed_id(removal), Some("g1".to_string()));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

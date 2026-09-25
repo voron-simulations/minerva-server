@@ -55,8 +55,10 @@ impl proto::group_service_server::GroupService for GroupServiceImpl {
         request: Request<proto::SubscribeGroupUpdatesRequest>,
     ) -> Result<Response<Self::SubscribeGroupUpdatesStream>, Status> {
         let side = parse_side(request.into_inner().side)?;
-        let snapshot = self.state.list_groups(side);
+        // Subscribe before reading the snapshot: an update that lands in
+        // between would otherwise be missed by both.
         let updates = self.state.subscribe_group_updates();
+        let snapshot = self.state.list_groups(side);
 
         let (tx, rx) = mpsc::channel(SUBSCRIBER_CHANNEL_CAPACITY);
         tokio::spawn(forward_group_updates(snapshot, side, updates, tx));
@@ -70,34 +72,43 @@ async fn forward_group_updates(
     mut updates: broadcast::Receiver<proto::SubscribeGroupUpdatesResponse>,
     tx: mpsc::Sender<Result<proto::SubscribeGroupUpdatesResponse, Status>>,
 ) {
+    use proto::subscribe_group_updates_response::Event;
+
     for group in snapshot {
-        if tx
-            .send(Ok(proto::SubscribeGroupUpdatesResponse {
-                group: Some(group),
-            }))
-            .await
-            .is_err()
-        {
+        let response = proto::SubscribeGroupUpdatesResponse {
+            event: Some(Event::Upserted(group)),
+        };
+        if tx.send(Ok(response)).await.is_err() {
             return;
         }
     }
 
     loop {
-        match updates.recv().await {
-            Ok(update) => {
-                let matches_side = side.is_none_or(|side| {
-                    update
-                        .group
-                        .as_ref()
-                        .is_some_and(|group| proto::Side::try_from(group.side) == Ok(side))
-                });
-                if matches_side && tx.send(Ok(update)).await.is_err() {
-                    return;
+        // Without racing `tx.closed()` here, a disconnected client's task
+        // (and its broadcast::Receiver) would linger until the next group
+        // update happened to occur, since `updates.recv()` alone won't
+        // notice a client that's gone away during an idle period.
+        tokio::select! {
+            () = tx.closed() => return,
+            update = updates.recv() => match update {
+                Ok(update) => {
+                    // A removal can't carry a side (the group's already
+                    // gone), so it's forwarded unconditionally: a
+                    // subscriber that never had this id just no-ops on it.
+                    let matches_side = match &update.event {
+                        Some(Event::Upserted(group)) => {
+                            side.is_none_or(|side| proto::Side::try_from(group.side) == Ok(side))
+                        }
+                        Some(Event::RemovedId(_)) | None => true,
+                    };
+                    if matches_side && tx.send(Ok(update)).await.is_err() {
+                        return;
+                    }
                 }
-            }
-            // A slow subscriber just misses what fell out of the buffer; keep going.
-            Err(broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(broadcast::error::RecvError::Closed) => return,
+                // A slow subscriber just misses what fell out of the buffer; keep going.
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return,
+            },
         }
     }
 }

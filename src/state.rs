@@ -58,17 +58,30 @@ impl StateCache {
         self.inner.write().units.remove(id)
     }
 
+    /// If `group` changes side relative to what was cached, first broadcasts
+    /// a removal for the old id: a subscriber filtered to the old side has
+    /// no other way to learn this group no longer matches its filter.
     pub fn upsert_group(&self, group: proto::Group) {
         let id = GroupId::from(group.id.clone());
-        self.inner.write().groups.insert(id, group.clone());
+        let side_changed = {
+            let mut inner = self.inner.write();
+            let previous_side = inner.groups.get(&id).map(|g| g.side);
+            inner.groups.insert(id, group.clone());
+            previous_side.is_some_and(|previous| previous != group.side)
+        };
+        if side_changed {
+            let _ = self.group_updates.send(group_removed(group.id.clone()));
+        }
         // No subscribers is the common case (e.g. no client connected yet); ignore it.
-        let _ = self
-            .group_updates
-            .send(proto::SubscribeGroupUpdatesResponse { group: Some(group) });
+        let _ = self.group_updates.send(group_upserted(group));
     }
 
     pub fn remove_group(&self, id: &GroupId) -> Option<proto::Group> {
-        self.inner.write().groups.remove(id)
+        let removed = self.inner.write().groups.remove(id);
+        if removed.is_some() {
+            let _ = self.group_updates.send(group_removed(id.to_string()));
+        }
+        removed
     }
 
     pub fn set_simulation_info(&self, info: proto::SimulationInfo) {
@@ -86,10 +99,20 @@ impl StateCache {
         self.inner.write().locations = locations;
     }
 
-    /// Drops all cached state. Does not affect existing subscriptions or
-    /// in-flight commands — see [`crate::Dispatcher::cancel_all`] for that.
+    /// Drops all cached state, broadcasting a removal for every group that
+    /// was present so subscribers don't retain stale entries across a
+    /// reset. Does not affect existing subscriptions or in-flight commands
+    /// — see [`crate::Dispatcher::cancel_all`] for that.
     pub fn clear(&self) {
-        *self.inner.write() = Inner::default();
+        let removed_ids: Vec<String> = {
+            let mut inner = self.inner.write();
+            let ids = inner.groups.keys().map(GroupId::to_string).collect();
+            *inner = Inner::default();
+            ids
+        };
+        for id in removed_ids {
+            let _ = self.group_updates.send(group_removed(id));
+        }
     }
 
     // --- reads (gRPC services) ---
@@ -166,6 +189,22 @@ impl StateCache {
         &self,
     ) -> broadcast::Receiver<proto::SubscribeGroupUpdatesResponse> {
         self.group_updates.subscribe()
+    }
+}
+
+fn group_upserted(group: proto::Group) -> proto::SubscribeGroupUpdatesResponse {
+    proto::SubscribeGroupUpdatesResponse {
+        event: Some(proto::subscribe_group_updates_response::Event::Upserted(
+            group,
+        )),
+    }
+}
+
+fn group_removed(id: String) -> proto::SubscribeGroupUpdatesResponse {
+    proto::SubscribeGroupUpdatesResponse {
+        event: Some(proto::subscribe_group_updates_response::Event::RemovedId(
+            id,
+        )),
     }
 }
 
@@ -340,11 +379,90 @@ mod tests {
         let cache = StateCache::new();
         let mut rx = cache.subscribe_group_updates();
         cache.upsert_group(group("g1", proto::Side::Blufor));
-        let update = match rx.recv().await {
+        assert_eq!(upserted_id(recv(&mut rx).await), Some("g1".to_string()));
+    }
+
+    fn upserted_id(response: proto::SubscribeGroupUpdatesResponse) -> Option<String> {
+        match response.event {
+            Some(proto::subscribe_group_updates_response::Event::Upserted(group)) => Some(group.id),
+            _ => None,
+        }
+    }
+
+    fn removed_id(response: proto::SubscribeGroupUpdatesResponse) -> Option<String> {
+        match response.event {
+            Some(proto::subscribe_group_updates_response::Event::RemovedId(id)) => Some(id),
+            _ => None,
+        }
+    }
+
+    async fn recv(
+        rx: &mut broadcast::Receiver<proto::SubscribeGroupUpdatesResponse>,
+    ) -> proto::SubscribeGroupUpdatesResponse {
+        match rx.recv().await {
             Ok(update) => update,
             Err(err) => panic!("channel closed unexpectedly: {err}"),
-        };
-        assert_eq!(update.group.map(|g| g.id), Some("g1".to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_group_broadcasts_removal() {
+        let cache = StateCache::new();
+        cache.upsert_group(group("g1", proto::Side::Blufor));
+        let mut rx = cache.subscribe_group_updates();
+        cache.remove_group(&GroupId::from("g1"));
+        assert_eq!(removed_id(recv(&mut rx).await), Some("g1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn remove_unknown_group_does_not_broadcast() {
+        let cache = StateCache::new();
+        let mut rx = cache.subscribe_group_updates();
+        assert_eq!(cache.remove_group(&GroupId::from("missing")), None);
+        assert_eq!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty));
+    }
+
+    #[tokio::test]
+    async fn upsert_group_broadcasts_removal_before_upsert_on_side_change() {
+        let cache = StateCache::new();
+        cache.upsert_group(group("g1", proto::Side::Blufor));
+        let mut rx = cache.subscribe_group_updates();
+
+        cache.upsert_group(group("g1", proto::Side::Opfor));
+
+        assert_eq!(removed_id(recv(&mut rx).await), Some("g1".to_string()));
+        assert_eq!(upserted_id(recv(&mut rx).await), Some("g1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn upsert_group_does_not_broadcast_removal_when_side_is_unchanged() {
+        let cache = StateCache::new();
+        cache.upsert_group(group("g1", proto::Side::Blufor));
+        let mut rx = cache.subscribe_group_updates();
+
+        cache.upsert_group(group("g1", proto::Side::Blufor));
+
+        assert_eq!(upserted_id(recv(&mut rx).await), Some("g1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn clear_broadcasts_removal_for_every_group() {
+        let cache = StateCache::new();
+        cache.upsert_group(group("g1", proto::Side::Blufor));
+        cache.upsert_group(group("g2", proto::Side::Opfor));
+        let mut rx = cache.subscribe_group_updates();
+
+        cache.clear();
+
+        let mut removed = vec![
+            removed_id(recv(&mut rx).await),
+            removed_id(recv(&mut rx).await),
+        ];
+        removed.sort();
+        assert_eq!(
+            removed,
+            vec![Some("g1".to_string()), Some("g2".to_string())]
+        );
     }
 
     #[tokio::test]
