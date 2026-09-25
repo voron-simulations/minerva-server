@@ -1,0 +1,56 @@
+name: PR
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - README.md
+      - .git*
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  fmt:
+    name: Format
+    uses: ./.github/workflows/reusable-fmt.yml
+    permissions:
+      contents: read
+
+  clippy:
+    name: Clippy
+    uses: ./.github/workflows/reusable-clippy.yml
+    permissions:
+      contents: read
+
+  test:
+    name: Test
+    needs: [fmt, clippy]
+    uses: ./.github/workflows/reusable-test.yml
+    permissions:
+      contents: read
+
+  coverage:
+    name: Coverage
+    needs: [fmt, clippy]
+    uses: ./.github/workflows/reusable-coverage.yml
+    permissions:
+      contents: read
+
+  bench:
+    name: Bench
+    needs: [fmt, clippy]
+    uses: ./.github/workflows/reusable-bench.yml
+    permissions:
+      contents: read
+
+  buf-generate:
+    name: Buf generate
+    uses: ./.github/workflows/reusable-buf-generate.yml
+    permissions:
+      contents: read
