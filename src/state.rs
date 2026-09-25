@@ -11,6 +11,23 @@ use crate::proto;
 /// state rather than blocking writers or buffering unboundedly.
 const BROADCAST_CAPACITY: usize = 64;
 
+/// A broadcast group update, tagged with the cache's sequence number as of
+/// the write that produced it. Internal only (never serialized) -- it's how
+/// the service layer tells a fresh subscriber's snapshot apart from updates
+/// that arrived after it, without a lock spanning both (see
+/// `subscribe_group_updates`'s doc).
+#[derive(Clone)]
+pub(crate) struct GroupEvent {
+    pub(crate) sequence: u64,
+    pub(crate) response: proto::SubscribeGroupUpdatesResponse,
+}
+
+#[derive(Clone)]
+pub(crate) struct SimulationEvent {
+    pub(crate) sequence: u64,
+    pub(crate) response: proto::SubscribeSimulationUpdatesResponse,
+}
+
 #[derive(Default)]
 struct Inner {
     units: HashMap<UnitId, proto::Unit>,
@@ -18,6 +35,16 @@ struct Inner {
     simulation_info: Option<proto::SimulationInfo>,
     simulation_state: Option<proto::SimulationStateUpdate>,
     locations: Vec<proto::Location>,
+    /// Bumped on every group/simulation-state mutation (not units/info/
+    /// locations, which aren't subscribable). See `GroupEvent`.
+    sequence: u64,
+}
+
+impl Inner {
+    fn next_sequence(&mut self) -> u64 {
+        self.sequence += 1;
+        self.sequence
+    }
 }
 
 /// Normalized, in-memory snapshot of simulation state, fed by the engine
@@ -26,8 +53,8 @@ struct Inner {
 /// to keep in sync, so membership can never disagree with itself.
 pub struct StateCache {
     inner: RwLock<Inner>,
-    simulation_updates: broadcast::Sender<proto::SubscribeSimulationUpdatesResponse>,
-    group_updates: broadcast::Sender<proto::SubscribeGroupUpdatesResponse>,
+    simulation_updates: broadcast::Sender<SimulationEvent>,
+    group_updates: broadcast::Sender<GroupEvent>,
 }
 
 impl Default for StateCache {
@@ -63,23 +90,40 @@ impl StateCache {
     /// no other way to learn this group no longer matches its filter.
     pub fn upsert_group(&self, group: proto::Group) {
         let id = GroupId::from(group.id.clone());
-        let side_changed = {
+        let (removal, upsert) = {
             let mut inner = self.inner.write();
             let previous_side = inner.groups.get(&id).map(|g| g.side);
             inner.groups.insert(id, group.clone());
-            previous_side.is_some_and(|previous| previous != group.side)
+            let side_changed = previous_side.is_some_and(|previous| previous != group.side);
+            let removal = side_changed.then(|| GroupEvent {
+                sequence: inner.next_sequence(),
+                response: group_removed(group.id.clone()),
+            });
+            let upsert = GroupEvent {
+                sequence: inner.next_sequence(),
+                response: group_upserted(group),
+            };
+            (removal, upsert)
         };
-        if side_changed {
-            let _ = self.group_updates.send(group_removed(group.id.clone()));
+        if let Some(removal) = removal {
+            let _ = self.group_updates.send(removal);
         }
         // No subscribers is the common case (e.g. no client connected yet); ignore it.
-        let _ = self.group_updates.send(group_upserted(group));
+        let _ = self.group_updates.send(upsert);
     }
 
     pub fn remove_group(&self, id: &GroupId) -> Option<proto::Group> {
-        let removed = self.inner.write().groups.remove(id);
-        if removed.is_some() {
-            let _ = self.group_updates.send(group_removed(id.to_string()));
+        let (removed, event) = {
+            let mut inner = self.inner.write();
+            let removed = inner.groups.remove(id);
+            let event = removed.is_some().then(|| GroupEvent {
+                sequence: inner.next_sequence(),
+                response: group_removed(id.to_string()),
+            });
+            (removed, event)
+        };
+        if let Some(event) = event {
+            let _ = self.group_updates.send(event);
         }
         removed
     }
@@ -89,10 +133,15 @@ impl StateCache {
     }
 
     pub fn set_simulation_state(&self, state: proto::SimulationStateUpdate) {
-        self.inner.write().simulation_state = Some(state);
-        let _ = self
-            .simulation_updates
-            .send(proto::SubscribeSimulationUpdatesResponse { state: Some(state) });
+        let event = {
+            let mut inner = self.inner.write();
+            inner.simulation_state = Some(state);
+            SimulationEvent {
+                sequence: inner.next_sequence(),
+                response: proto::SubscribeSimulationUpdatesResponse { state: Some(state) },
+            }
+        };
+        let _ = self.simulation_updates.send(event);
     }
 
     pub fn set_locations(&self, locations: Vec<proto::Location>) {
@@ -100,19 +149,36 @@ impl StateCache {
     }
 
     /// Drops all cached state, broadcasting a removal for every group that
-    /// was present so subscribers don't retain stale entries across a
-    /// reset. Does not affect existing subscriptions or in-flight commands
-    /// — see [`crate::Dispatcher::cancel_all`] for that.
+    /// was present and a `state: None` simulation update, so subscribers
+    /// don't retain stale entries/time/weather across a reset. Does not
+    /// affect existing subscriptions or in-flight commands — see
+    /// [`crate::Dispatcher::cancel_all`] for that.
     pub fn clear(&self) {
-        let removed_ids: Vec<String> = {
+        // One critical section for everything, so every event this produces
+        // gets its sequence number from the same, correctly-ordered place
+        // (a group removal from a second `clear()` call, or an unrelated
+        // upsert on another thread, can't end up interleaved with these).
+        let (group_events, sim_event) = {
             let mut inner = self.inner.write();
-            let ids = inner.groups.keys().map(GroupId::to_string).collect();
+            let ids: Vec<String> = inner.groups.keys().map(GroupId::to_string).collect();
             *inner = Inner::default();
-            ids
+            let group_events: Vec<GroupEvent> = ids
+                .into_iter()
+                .map(|id| GroupEvent {
+                    sequence: inner.next_sequence(),
+                    response: group_removed(id),
+                })
+                .collect();
+            let sim_event = SimulationEvent {
+                sequence: inner.next_sequence(),
+                response: proto::SubscribeSimulationUpdatesResponse { state: None },
+            };
+            (group_events, sim_event)
         };
-        for id in removed_ids {
-            let _ = self.group_updates.send(group_removed(id));
+        for event in group_events {
+            let _ = self.group_updates.send(event);
         }
+        let _ = self.simulation_updates.send(sim_event);
     }
 
     // --- reads (gRPC services) ---
@@ -178,17 +244,45 @@ impl StateCache {
     }
 
     // --- subscriptions ---
+    //
+    // Each of these subscribes *before* reading the snapshot (so an update
+    // landing in between isn't missed by both), and returns the snapshot's
+    // sequence number alongside it. The service layer discards any received
+    // event whose sequence is <= that number: without this, an update that
+    // both landed in the just-created receiver's buffer *and* is already
+    // reflected in the snapshot (read a moment later) would replay as a
+    // spurious, out-of-order duplicate after the snapshot.
 
-    pub fn subscribe_simulation_updates(
+    /// Returns the current simulation state (if any), its sequence number,
+    /// and a receiver for updates from this point on.
+    pub(crate) fn subscribe_simulation_updates(
         &self,
-    ) -> broadcast::Receiver<proto::SubscribeSimulationUpdatesResponse> {
-        self.simulation_updates.subscribe()
+    ) -> (
+        Option<proto::SimulationStateUpdate>,
+        u64,
+        broadcast::Receiver<SimulationEvent>,
+    ) {
+        let receiver = self.simulation_updates.subscribe();
+        let inner = self.inner.read();
+        (inner.simulation_state, inner.sequence, receiver)
     }
 
-    pub fn subscribe_group_updates(
+    /// Returns the groups currently matching `side`, the sequence number
+    /// that snapshot was taken at, and a receiver for updates from this
+    /// point on.
+    pub(crate) fn subscribe_group_updates(
         &self,
-    ) -> broadcast::Receiver<proto::SubscribeGroupUpdatesResponse> {
-        self.group_updates.subscribe()
+        side: Option<proto::Side>,
+    ) -> (Vec<proto::Group>, u64, broadcast::Receiver<GroupEvent>) {
+        let receiver = self.group_updates.subscribe();
+        let inner = self.inner.read();
+        let groups = inner
+            .groups
+            .values()
+            .filter(|group| side.is_none_or(|side| proto::Side::try_from(group.side) == Ok(side)))
+            .cloned()
+            .collect();
+        (groups, inner.sequence, receiver)
     }
 }
 
@@ -374,14 +468,6 @@ mod tests {
         assert_eq!(cache.list_locations(None).len(), 0);
     }
 
-    #[tokio::test]
-    async fn subscribe_group_updates_receives_upsert() {
-        let cache = StateCache::new();
-        let mut rx = cache.subscribe_group_updates();
-        cache.upsert_group(group("g1", proto::Side::Blufor));
-        assert_eq!(upserted_id(recv(&mut rx).await), Some("g1".to_string()));
-    }
-
     fn upserted_id(response: proto::SubscribeGroupUpdatesResponse) -> Option<String> {
         match response.event {
             Some(proto::subscribe_group_updates_response::Event::Upserted(group)) => Some(group.id),
@@ -396,53 +482,110 @@ mod tests {
         }
     }
 
-    async fn recv(
-        rx: &mut broadcast::Receiver<proto::SubscribeGroupUpdatesResponse>,
+    async fn recv_group(
+        rx: &mut broadcast::Receiver<GroupEvent>,
     ) -> proto::SubscribeGroupUpdatesResponse {
         match rx.recv().await {
-            Ok(update) => update,
+            Ok(event) => event.response,
             Err(err) => panic!("channel closed unexpectedly: {err}"),
         }
+    }
+
+    #[tokio::test]
+    async fn subscribe_group_updates_receives_upsert() {
+        let cache = StateCache::new();
+        let (_, _, mut rx) = cache.subscribe_group_updates(None);
+        cache.upsert_group(group("g1", proto::Side::Blufor));
+        assert_eq!(
+            upserted_id(recv_group(&mut rx).await),
+            Some("g1".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_group_updates_returns_current_snapshot() {
+        let cache = StateCache::new();
+        cache.upsert_group(group("g1", proto::Side::Blufor));
+        let (snapshot, _, _rx) = cache.subscribe_group_updates(None);
+        assert_eq!(
+            snapshot.iter().map(|g| g.id.as_str()).collect::<Vec<_>>(),
+            vec!["g1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_group_updates_skips_events_already_in_the_snapshot() {
+        let cache = StateCache::new();
+        cache.upsert_group(group("g1", proto::Side::Blufor));
+        let (_, sequence, mut rx) = cache.subscribe_group_updates(None);
+        // Simulates the race the sequence number exists to close: an update
+        // that happened before the snapshot was read, but is still sitting
+        // in the receiver's buffer (subscribe happened first, per the
+        // ordering above).
+        cache.upsert_group(group("g2", proto::Side::Blufor));
+        let stale = match rx.recv().await {
+            Ok(event) => event,
+            Err(err) => panic!("channel closed unexpectedly: {err}"),
+        };
+        assert!(
+            stale.sequence > sequence,
+            "test setup: event should be newer than the snapshot"
+        );
+        // The service layer is what actually filters on `.sequence` (see
+        // services/group.rs); this just proves the number itself is usable
+        // for that: strictly increasing, and available before/after a send.
     }
 
     #[tokio::test]
     async fn remove_group_broadcasts_removal() {
         let cache = StateCache::new();
         cache.upsert_group(group("g1", proto::Side::Blufor));
-        let mut rx = cache.subscribe_group_updates();
+        let (_, _, mut rx) = cache.subscribe_group_updates(None);
         cache.remove_group(&GroupId::from("g1"));
-        assert_eq!(removed_id(recv(&mut rx).await), Some("g1".to_string()));
+        assert_eq!(
+            removed_id(recv_group(&mut rx).await),
+            Some("g1".to_string())
+        );
     }
 
     #[tokio::test]
     async fn remove_unknown_group_does_not_broadcast() {
         let cache = StateCache::new();
-        let mut rx = cache.subscribe_group_updates();
+        let (_, _, mut rx) = cache.subscribe_group_updates(None);
         assert_eq!(cache.remove_group(&GroupId::from("missing")), None);
-        assert_eq!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty));
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
     async fn upsert_group_broadcasts_removal_before_upsert_on_side_change() {
         let cache = StateCache::new();
         cache.upsert_group(group("g1", proto::Side::Blufor));
-        let mut rx = cache.subscribe_group_updates();
+        let (_, _, mut rx) = cache.subscribe_group_updates(None);
 
         cache.upsert_group(group("g1", proto::Side::Opfor));
 
-        assert_eq!(removed_id(recv(&mut rx).await), Some("g1".to_string()));
-        assert_eq!(upserted_id(recv(&mut rx).await), Some("g1".to_string()));
+        assert_eq!(
+            removed_id(recv_group(&mut rx).await),
+            Some("g1".to_string())
+        );
+        assert_eq!(
+            upserted_id(recv_group(&mut rx).await),
+            Some("g1".to_string())
+        );
     }
 
     #[tokio::test]
     async fn upsert_group_does_not_broadcast_removal_when_side_is_unchanged() {
         let cache = StateCache::new();
         cache.upsert_group(group("g1", proto::Side::Blufor));
-        let mut rx = cache.subscribe_group_updates();
+        let (_, _, mut rx) = cache.subscribe_group_updates(None);
 
         cache.upsert_group(group("g1", proto::Side::Blufor));
 
-        assert_eq!(upserted_id(recv(&mut rx).await), Some("g1".to_string()));
+        assert_eq!(
+            upserted_id(recv_group(&mut rx).await),
+            Some("g1".to_string())
+        );
     }
 
     #[tokio::test]
@@ -450,13 +593,13 @@ mod tests {
         let cache = StateCache::new();
         cache.upsert_group(group("g1", proto::Side::Blufor));
         cache.upsert_group(group("g2", proto::Side::Opfor));
-        let mut rx = cache.subscribe_group_updates();
+        let (_, _, mut rx) = cache.subscribe_group_updates(None);
 
         cache.clear();
 
         let mut removed = vec![
-            removed_id(recv(&mut rx).await),
-            removed_id(recv(&mut rx).await),
+            removed_id(recv_group(&mut rx).await),
+            removed_id(recv_group(&mut rx).await),
         ];
         removed.sort();
         assert_eq!(
@@ -468,15 +611,44 @@ mod tests {
     #[tokio::test]
     async fn subscribe_simulation_updates_receives_state() {
         let cache = StateCache::new();
-        let mut rx = cache.subscribe_simulation_updates();
+        let (_, _, mut rx) = cache.subscribe_simulation_updates();
         cache.set_simulation_state(proto::SimulationStateUpdate {
             simulation_time: 7,
             ..Default::default()
         });
-        let update = match rx.recv().await {
-            Ok(update) => update,
+        let event = match rx.recv().await {
+            Ok(event) => event,
             Err(err) => panic!("channel closed unexpectedly: {err}"),
         };
-        assert_eq!(update.state.map(|s| s.simulation_time), Some(7));
+        assert_eq!(event.response.state.map(|s| s.simulation_time), Some(7));
+    }
+
+    #[tokio::test]
+    async fn subscribe_simulation_updates_returns_current_snapshot() {
+        let cache = StateCache::new();
+        cache.set_simulation_state(proto::SimulationStateUpdate {
+            simulation_time: 5,
+            ..Default::default()
+        });
+        let (snapshot, _, _rx) = cache.subscribe_simulation_updates();
+        assert_eq!(snapshot.map(|s| s.simulation_time), Some(5));
+    }
+
+    #[tokio::test]
+    async fn clear_broadcasts_simulation_reset() {
+        let cache = StateCache::new();
+        cache.set_simulation_state(proto::SimulationStateUpdate {
+            simulation_time: 9,
+            ..Default::default()
+        });
+        let (_, _, mut rx) = cache.subscribe_simulation_updates();
+
+        cache.clear();
+
+        let event = match rx.recv().await {
+            Ok(event) => event,
+            Err(err) => panic!("channel closed unexpectedly: {err}"),
+        };
+        assert_eq!(event.response.state, None);
     }
 }

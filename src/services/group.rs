@@ -7,7 +7,7 @@ use tonic::{Request, Response, Status};
 use crate::ids::GroupId;
 use crate::proto;
 use crate::services::{ResponseStream, parse_side};
-use crate::state::StateCache;
+use crate::state::{GroupEvent, StateCache};
 
 /// Bound on the outgoing channel for a single subscriber; bounded so a slow
 /// client applies backpressure rather than letting updates queue forever.
@@ -55,21 +55,25 @@ impl proto::group_service_server::GroupService for GroupServiceImpl {
         request: Request<proto::SubscribeGroupUpdatesRequest>,
     ) -> Result<Response<Self::SubscribeGroupUpdatesStream>, Status> {
         let side = parse_side(request.into_inner().side)?;
-        // Subscribe before reading the snapshot: an update that lands in
-        // between would otherwise be missed by both.
-        let updates = self.state.subscribe_group_updates();
-        let snapshot = self.state.list_groups(side);
+        let (snapshot, snapshot_sequence, updates) = self.state.subscribe_group_updates(side);
 
         let (tx, rx) = mpsc::channel(SUBSCRIBER_CHANNEL_CAPACITY);
-        tokio::spawn(forward_group_updates(snapshot, side, updates, tx));
+        tokio::spawn(forward_group_updates(
+            snapshot,
+            snapshot_sequence,
+            side,
+            updates,
+            tx,
+        ));
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 }
 
 async fn forward_group_updates(
     snapshot: Vec<proto::Group>,
+    snapshot_sequence: u64,
     side: Option<proto::Side>,
-    mut updates: broadcast::Receiver<proto::SubscribeGroupUpdatesResponse>,
+    mut updates: broadcast::Receiver<GroupEvent>,
     tx: mpsc::Sender<Result<proto::SubscribeGroupUpdatesResponse, Status>>,
 ) {
     use proto::subscribe_group_updates_response::Event;
@@ -91,7 +95,16 @@ async fn forward_group_updates(
         tokio::select! {
             () = tx.closed() => return,
             update = updates.recv() => match update {
-                Ok(update) => {
+                Ok(event) => {
+                    // Already reflected in (or older than) the snapshot
+                    // above: without this check, an update that landed in
+                    // this receiver's buffer between it being created and
+                    // the snapshot being read would replay here, showing
+                    // the client newest (snapshot) -> older (this) state.
+                    if event.sequence <= snapshot_sequence {
+                        continue;
+                    }
+                    let update = event.response;
                     // A removal can't carry a side (the group's already
                     // gone), so it's forwarded unconditionally: a
                     // subscriber that never had this id just no-ops on it.

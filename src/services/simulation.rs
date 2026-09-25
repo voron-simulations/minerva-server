@@ -6,7 +6,7 @@ use tonic::{Request, Response, Status};
 
 use crate::proto;
 use crate::services::ResponseStream;
-use crate::state::StateCache;
+use crate::state::{SimulationEvent, StateCache};
 
 const SUBSCRIBER_CHANNEL_CAPACITY: usize = 16;
 
@@ -42,20 +42,23 @@ impl proto::simulation_service_server::SimulationService for SimulationServiceIm
         &self,
         _request: Request<proto::SubscribeSimulationUpdatesRequest>,
     ) -> Result<Response<Self::SubscribeSimulationUpdatesStream>, Status> {
-        // Subscribe before reading the snapshot: an update that lands in
-        // between would otherwise be missed by both.
-        let updates = self.state.subscribe_simulation_updates();
-        let snapshot = self.state.simulation_state();
+        let (snapshot, snapshot_sequence, updates) = self.state.subscribe_simulation_updates();
 
         let (tx, rx) = mpsc::channel(SUBSCRIBER_CHANNEL_CAPACITY);
-        tokio::spawn(forward_simulation_updates(snapshot, updates, tx));
+        tokio::spawn(forward_simulation_updates(
+            snapshot,
+            snapshot_sequence,
+            updates,
+            tx,
+        ));
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 }
 
 async fn forward_simulation_updates(
     snapshot: Option<proto::SimulationStateUpdate>,
-    mut updates: broadcast::Receiver<proto::SubscribeSimulationUpdatesResponse>,
+    snapshot_sequence: u64,
+    mut updates: broadcast::Receiver<SimulationEvent>,
     tx: mpsc::Sender<Result<proto::SubscribeSimulationUpdatesResponse, Status>>,
 ) {
     if let Some(state) = snapshot
@@ -76,8 +79,14 @@ async fn forward_simulation_updates(
         tokio::select! {
             () = tx.closed() => return,
             update = updates.recv() => match update {
-                Ok(update) => {
-                    if tx.send(Ok(update)).await.is_err() {
+                Ok(event) => {
+                    // Already reflected in (or older than) the snapshot
+                    // above -- see the matching comment in
+                    // services/group.rs's forward_group_updates.
+                    if event.sequence <= snapshot_sequence {
+                        continue;
+                    }
+                    if tx.send(Ok(event.response)).await.is_err() {
                         return;
                     }
                 }
