@@ -51,6 +51,11 @@ impl Inner {
 /// thread and read by the gRPC services. `Unit.group_id` is the only place
 /// group membership is recorded — there is no separate group -> units index
 /// to keep in sync, so membership can never disagree with itself.
+///
+/// Every broadcast is sent while still holding the write lock that produced
+/// it (`broadcast::Sender::send` never blocks or runs foreign code), so
+/// subscribers see events in exactly the order their mutations committed —
+/// e.g. a `clear()` removal can't overtake a concurrent re-upsert.
 pub struct StateCache {
     inner: RwLock<Inner>,
     simulation_updates: broadcast::Sender<SimulationEvent>,
@@ -90,39 +95,32 @@ impl StateCache {
     /// no other way to learn this group no longer matches its filter.
     pub fn upsert_group(&self, group: proto::Group) {
         let id = GroupId::from(group.id.clone());
-        let (removal, upsert) = {
-            let mut inner = self.inner.write();
-            let previous_side = inner.groups.get(&id).map(|g| g.side);
-            inner.groups.insert(id, group.clone());
-            let side_changed = previous_side.is_some_and(|previous| previous != group.side);
-            let removal = side_changed.then(|| GroupEvent {
+        let mut inner = self.inner.write();
+        let previous_side = inner.groups.get(&id).map(|g| g.side);
+        inner.groups.insert(id, group.clone());
+        if previous_side.is_some_and(|previous| previous != group.side) {
+            let removal = GroupEvent {
                 sequence: inner.next_sequence(),
                 response: group_removed(group.id.clone()),
-            });
-            let upsert = GroupEvent {
-                sequence: inner.next_sequence(),
-                response: group_upserted(group),
             };
-            (removal, upsert)
-        };
-        if let Some(removal) = removal {
+            // No subscribers is the common case (e.g. no client connected yet); ignore it.
             let _ = self.group_updates.send(removal);
         }
-        // No subscribers is the common case (e.g. no client connected yet); ignore it.
+        let upsert = GroupEvent {
+            sequence: inner.next_sequence(),
+            response: group_upserted(group),
+        };
         let _ = self.group_updates.send(upsert);
     }
 
     pub fn remove_group(&self, id: &GroupId) -> Option<proto::Group> {
-        let (removed, event) = {
-            let mut inner = self.inner.write();
-            let removed = inner.groups.remove(id);
-            let event = removed.is_some().then(|| GroupEvent {
+        let mut inner = self.inner.write();
+        let removed = inner.groups.remove(id);
+        if removed.is_some() {
+            let event = GroupEvent {
                 sequence: inner.next_sequence(),
                 response: group_removed(id.to_string()),
-            });
-            (removed, event)
-        };
-        if let Some(event) = event {
+            };
             let _ = self.group_updates.send(event);
         }
         removed
@@ -133,13 +131,11 @@ impl StateCache {
     }
 
     pub fn set_simulation_state(&self, state: proto::SimulationStateUpdate) {
-        let event = {
-            let mut inner = self.inner.write();
-            inner.simulation_state = Some(state);
-            SimulationEvent {
-                sequence: inner.next_sequence(),
-                response: proto::SubscribeSimulationUpdatesResponse { state: Some(state) },
-            }
+        let mut inner = self.inner.write();
+        inner.simulation_state = Some(state);
+        let event = SimulationEvent {
+            sequence: inner.next_sequence(),
+            response: proto::SubscribeSimulationUpdatesResponse { state: Some(state) },
         };
         let _ = self.simulation_updates.send(event);
     }
@@ -154,30 +150,26 @@ impl StateCache {
     /// affect existing subscriptions or in-flight commands — see
     /// [`crate::Dispatcher::cancel_all`] for that.
     pub fn clear(&self) {
-        // One critical section for everything, so every event this produces
-        // gets its sequence number from the same, correctly-ordered place
-        // (a group removal from a second `clear()` call, or an unrelated
-        // upsert on another thread, can't end up interleaved with these).
-        let (group_events, sim_event) = {
-            let mut inner = self.inner.write();
-            let ids: Vec<String> = inner.groups.keys().map(GroupId::to_string).collect();
-            *inner = Inner::default();
-            let group_events: Vec<GroupEvent> = ids
-                .into_iter()
-                .map(|id| GroupEvent {
-                    sequence: inner.next_sequence(),
-                    response: group_removed(id),
-                })
-                .collect();
-            let sim_event = SimulationEvent {
-                sequence: inner.next_sequence(),
-                response: proto::SubscribeSimulationUpdatesResponse { state: None },
-            };
-            (group_events, sim_event)
+        let mut inner = self.inner.write();
+        let ids: Vec<String> = inner.groups.keys().map(GroupId::to_string).collect();
+        // Keep the sequence monotonic: subscribers discard events at or below
+        // their snapshot's sequence, so resetting it would silently drop these
+        // removals (and every update after them until the counter caught up).
+        *inner = Inner {
+            sequence: inner.sequence,
+            ..Inner::default()
         };
-        for event in group_events {
+        for id in ids {
+            let event = GroupEvent {
+                sequence: inner.next_sequence(),
+                response: group_removed(id),
+            };
             let _ = self.group_updates.send(event);
         }
+        let sim_event = SimulationEvent {
+            sequence: inner.next_sequence(),
+            response: proto::SubscribeSimulationUpdatesResponse { state: None },
+        };
         let _ = self.simulation_updates.send(sim_event);
     }
 
@@ -606,6 +598,61 @@ mod tests {
             removed,
             vec![Some("g1".to_string()), Some("g2".to_string())]
         );
+    }
+
+    #[tokio::test]
+    async fn clear_events_are_newer_than_prior_snapshots() {
+        let cache = StateCache::new();
+        cache.upsert_group(group("g1", proto::Side::Blufor));
+        cache.set_simulation_state(proto::SimulationStateUpdate::default());
+        let (_, group_sequence, mut group_rx) = cache.subscribe_group_updates(None);
+        let (_, sim_sequence, mut sim_rx) = cache.subscribe_simulation_updates();
+
+        cache.clear();
+
+        let removal = match group_rx.recv().await {
+            Ok(event) => event,
+            Err(err) => panic!("channel closed unexpectedly: {err}"),
+        };
+        assert!(removal.sequence > group_sequence);
+        let reset = match sim_rx.recv().await {
+            Ok(event) => event,
+            Err(err) => panic!("channel closed unexpectedly: {err}"),
+        };
+        assert!(reset.sequence > sim_sequence);
+
+        cache.upsert_group(group("g2", proto::Side::Blufor));
+        let upsert = match group_rx.recv().await {
+            Ok(event) => event,
+            Err(err) => panic!("channel closed unexpectedly: {err}"),
+        };
+        assert!(upsert.sequence > removal.sequence);
+    }
+
+    #[tokio::test]
+    async fn concurrent_writes_broadcast_in_sequence_order() {
+        let cache = std::sync::Arc::new(StateCache::new());
+        let (_, _, mut rx) = cache.subscribe_group_updates(None);
+        let writers: Vec<_> = (0..4)
+            .map(|t| {
+                let cache = cache.clone();
+                std::thread::spawn(move || {
+                    for i in 0..10 {
+                        cache.upsert_group(group(&format!("g{t}-{i}"), proto::Side::Blufor));
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().expect("writer thread panicked");
+        }
+
+        let mut last = 0;
+        while let Ok(event) = rx.try_recv() {
+            assert!(event.sequence > last, "broadcast out of mutation order");
+            last = event.sequence;
+        }
+        assert_eq!(last, 40);
     }
 
     #[tokio::test]
