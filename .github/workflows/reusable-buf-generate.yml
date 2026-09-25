@@ -10,9 +10,16 @@ jobs:
     timeout-minutes: 10
 
     steps:
+      # Both checkouts use an explicit `path` (rather than the default
+      # $GITHUB_WORKSPACE root) so minerva-protocol lands as a sibling of
+      # minerva-server, matching buf.gen.yaml's `../minerva-protocol` input.
+      # actions/checkout refuses a `path` that escapes $GITHUB_WORKSPACE, so
+      # this can't be done by checking minerva-server out to the workspace
+      # root and minerva-protocol to `../minerva-protocol`.
       - name: Checkout minerva-server
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          path: minerva-server
           persist-credentials: false
 
       # TODO: once minerva-protocol has a commit on the BSR module
@@ -25,14 +32,16 @@ jobs:
         with:
           repository: voron-simulations/minerva-protocol
           ref: feat/buf-v1
-          path: ../minerva-protocol
+          path: minerva-protocol
           persist-credentials: false
 
       - name: Setup buf
         uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
 
       - name: Generate
+        working-directory: minerva-server
         run: buf generate
 
       - name: Fail on diff
+        working-directory: minerva-server
         run: git diff --exit-code -- src/gen
