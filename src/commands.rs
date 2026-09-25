@@ -165,6 +165,7 @@ impl Dispatcher {
     pub async fn send(&self, command: Command) -> CommandOutcome {
         let id = self.ids.next();
         let (tx, rx) = oneshot::channel();
+        let _guard;
         {
             // insert() and dispatch() share this critical section with
             // cancel_all()'s drain, so the two are strictly ordered rather
@@ -175,15 +176,17 @@ impl Dispatcher {
             // about whether the command happened.
             let pending = self.pending.lock();
             pending.borrow_mut().insert(id, tx);
+            // Constructed before dispatch(), and while `pending` is still
+            // held (the mutex is reentrant, so the guard's own drop can
+            // re-lock it): if engine-owned `dispatch()` panics, unwinding
+            // drops this guard and removes the entry, rather than leaking
+            // it in `pending` forever.
+            _guard = RemovePending {
+                pending: &self.pending,
+                id,
+            };
             self.sink.dispatch(id, &command);
         }
-        // Removes `id` from `pending` on every exit from here on, including
-        // this future being dropped before completing (e.g. the gRPC caller
-        // disconnected) -- not just the timeout path below.
-        let _guard = RemovePending {
-            pending: &self.pending,
-            id,
-        };
 
         match tokio::time::timeout(self.timeout, rx).await {
             Ok(Ok(outcome)) => outcome,
