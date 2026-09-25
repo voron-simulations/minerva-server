@@ -273,13 +273,14 @@ pub struct SubscribeGroupUpdatesResponse {
 pub mod subscribe_group_updates_response {
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Event {
-        /// The group was created or changed (including no longer matching this
-        /// subscription's side filter as of a side change -- treat the same as
-        /// removed).
+        /// The group was created or changed. Sent only to subscribers whose side
+        /// filter (if any) matches the group's current side.
         #[prost(message, tag="1")]
         Upserted(super::Group),
-        /// The group with this id was removed (or stopped matching this
-        /// subscription's side filter).
+        /// The group with this id should no longer be tracked: it was removed,
+        /// or it stopped matching this subscription's side filter (e.g. its
+        /// side changed). Sent regardless of any side filter, since the id
+        /// alone doesn't carry a side to filter on.
         #[prost(string, tag="2")]
         RemovedId(::prost::alloc::string::String),
     }
