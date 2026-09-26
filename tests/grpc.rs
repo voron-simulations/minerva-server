@@ -15,9 +15,9 @@ use minerva_server::proto::simulation_service_client::SimulationServiceClient;
 use minerva_server::proto::subscribe_group_updates_response::Event as GroupEvent;
 use minerva_server::proto::unit_service_client::UnitServiceClient;
 use minerva_server::proto::{
-    CommandResult, GetSimulationInfoRequest, GetUnitRequest, Group, ListGroupsRequest,
-    ListLocationsRequest, ListUnitsRequest, Location, MoveCommand, Position, SendCommandRequest,
-    Side, SimulationInfo, SimulationStateUpdate, SubscribeGroupUpdatesRequest,
+    CommandResult, CommandTarget, GetSimulationInfoRequest, GetUnitRequest, Group,
+    ListGroupsRequest, ListLocationsRequest, ListUnitsRequest, Location, MoveCommand, Position,
+    SendCommandRequest, Side, SimulationInfo, SimulationStateUpdate, SubscribeGroupUpdatesRequest,
     SubscribeGroupUpdatesResponse, SubscribeSimulationUpdatesRequest, Unit, UnitState,
 };
 use minerva_server::{Command, CommandId, CommandSink, GroupId, ServerConfig, ServerHandle};
@@ -101,6 +101,20 @@ fn a_group(id: &str, side: Side) -> Group {
         readiness: None,
         has_task: false,
         waypoints: Vec::new(),
+        units: Vec::new(),
+    }
+}
+
+fn move_request(group_id: &str) -> SendCommandRequest {
+    SendCommandRequest {
+        command: Some(CommandOneof::Move(MoveCommand {
+            position: Some(CommandTarget {
+                x: 1.0,
+                y: 2.0,
+                z: Some(3.0),
+            }),
+            group_id: group_id.to_string(),
+        })),
     }
 }
 
@@ -194,6 +208,96 @@ async fn subscribe_group_updates_yields_snapshot_then_update() {
     assert_eq!(removed_id(removal), Some("g1".to_string()));
 }
 
+fn upserted_units(response: SubscribeGroupUpdatesResponse) -> Option<Vec<String>> {
+    match response.event {
+        Some(GroupEvent::Upserted(group)) => {
+            Some(group.units.into_iter().map(|unit| unit.id).collect())
+        }
+        _ => None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn group_stream_carries_unit_moves_and_membership_changes() {
+    let (handle, _rx) = spawn_server(Duration::from_secs(5));
+    let origin = Position {
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+    };
+    handle.state().upsert_group_with_units(
+        a_group("g1", Side::Blufor),
+        vec![a_unit("u1", "g1", origin)],
+    );
+
+    let mut groups = expect(GroupServiceClient::connect(endpoint(handle.local_addr())).await);
+    let mut stream = expect(
+        groups
+            .subscribe_group_updates(SubscribeGroupUpdatesRequest { side: None })
+            .await,
+    )
+    .into_inner();
+
+    let snapshot = expect(expect_some(stream.next().await));
+    assert_eq!(upserted_units(snapshot), Some(vec!["u1".to_string()]));
+
+    // A unit moving (still the sole member) re-broadcasts the group with
+    // its updated state.
+    let moved = Position {
+        x: 10.0,
+        y: 0.0,
+        z: 0.0,
+    };
+    handle
+        .state()
+        .upsert_group_with_units(a_group("g1", Side::Blufor), vec![a_unit("u1", "g1", moved)]);
+    let update = expect(expect_some(stream.next().await));
+    let group = match update.event {
+        Some(GroupEvent::Upserted(group)) => group,
+        other => panic!("expected an upsert, got {other:?}"),
+    };
+    assert_eq!(
+        group.units[0].state.as_ref().and_then(|s| s.position),
+        Some(moved)
+    );
+
+    // Replacing the member set with a second unit drops the first one from
+    // the group's joined view -- and since it had nowhere else to belong,
+    // it's gone from the cache entirely, not just detached.
+    handle.state().upsert_group_with_units(
+        a_group("g1", Side::Blufor),
+        vec![a_unit("u2", "g1", origin)],
+    );
+    let replaced = expect(expect_some(stream.next().await));
+    assert_eq!(upserted_units(replaced), Some(vec!["u2".to_string()]));
+
+    let mut units = expect(UnitServiceClient::connect(endpoint(handle.local_addr())).await);
+    let listed = expect(
+        units
+            .list_units(ListUnitsRequest {
+                side: None,
+                group_id: None,
+            })
+            .await,
+    )
+    .into_inner();
+    assert_eq!(
+        listed
+            .units
+            .iter()
+            .map(|u| u.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["u2"]
+    );
+}
+
+// A lagged subscriber being aborted (rather than silently resynced) is
+// tested at the unit level, inside src/services/group.rs and
+// src/services/simulation.rs: driving the real gRPC transport hard enough
+// to overflow the broadcast channel isn't reliable from here, since the
+// forwarding task keeps draining it as long as *anything* downstream is
+// accepting bytes, whether or not this test calls `stream.next()`.
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn list_locations_filters_by_owner_side() {
     let (handle, _rx) = spawn_server(Duration::from_secs(5));
@@ -285,16 +389,7 @@ async fn send_command_acked_returns_success() {
     handle.state().upsert_group(a_group("g1", Side::Blufor));
 
     let mut commands = expect(CommandServiceClient::connect(endpoint(handle.local_addr())).await);
-    let request = SendCommandRequest {
-        command: Some(CommandOneof::Move(MoveCommand {
-            position: Some(Position {
-                x: 1.0,
-                y: 2.0,
-                z: 3.0,
-            }),
-            group_id: "g1".to_string(),
-        })),
-    };
+    let request = move_request("g1");
 
     let dispatcher = handle.dispatcher().clone();
     let call = tokio::spawn(async move { commands.send_command(request).await });
@@ -313,16 +408,7 @@ async fn send_command_without_ack_times_out() {
     handle.state().upsert_group(a_group("g1", Side::Blufor));
 
     let mut commands = expect(CommandServiceClient::connect(endpoint(handle.local_addr())).await);
-    let request = SendCommandRequest {
-        command: Some(CommandOneof::Move(MoveCommand {
-            position: Some(Position {
-                x: 1.0,
-                y: 2.0,
-                z: 3.0,
-            }),
-            group_id: "g1".to_string(),
-        })),
-    };
+    let request = move_request("g1");
 
     let response = expect(commands.send_command(request).await).into_inner();
     assert_eq!(response.result, CommandResult::Failure as i32);
@@ -334,16 +420,7 @@ async fn send_command_unknown_group_fails_without_dispatch() {
     let (handle, mut rx) = spawn_server(Duration::from_secs(5));
 
     let mut commands = expect(CommandServiceClient::connect(endpoint(handle.local_addr())).await);
-    let request = SendCommandRequest {
-        command: Some(CommandOneof::Move(MoveCommand {
-            position: Some(Position {
-                x: 1.0,
-                y: 2.0,
-                z: 3.0,
-            }),
-            group_id: "no-such-group".to_string(),
-        })),
-    };
+    let request = move_request("no-such-group");
 
     let response = expect(commands.send_command(request).await).into_inner();
     assert_eq!(response.result, CommandResult::Failure as i32);

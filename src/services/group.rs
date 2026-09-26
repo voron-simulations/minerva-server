@@ -118,10 +118,64 @@ async fn forward_group_updates(
                         return;
                     }
                 }
-                // A slow subscriber just misses what fell out of the buffer; keep going.
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                // A slow subscriber can no longer be told what it missed
+                // (the buffer already dropped it), so it's aborted rather
+                // than silently resynced -- the contract's documented way
+                // for a client to recover is to resubscribe and rebuild.
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    let _ = tx
+                        .send(Err(Status::aborted("subscriber lagged; resubscribe")))
+                        .await;
+                    return;
+                }
                 Err(broadcast::error::RecvError::Closed) => return,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn a_group(id: &str, side: proto::Side) -> proto::Group {
+        proto::Group {
+            id: id.to_string(),
+            side: side as i32,
+            readiness: None,
+            has_task: false,
+            waypoints: Vec::new(),
+            units: Vec::new(),
+        }
+    }
+
+    /// Drives `forward_group_updates` directly against a receiver that's
+    /// already fallen behind, bypassing the gRPC transport entirely: proving
+    /// this maps `Lagged` to an aborted response doesn't depend on how much
+    /// backpressure the network happens to apply.
+    #[tokio::test]
+    async fn aborts_a_lagged_subscriber() {
+        let cache = StateCache::new();
+        let (_, _, updates) = cache.subscribe_group_updates(None);
+        // Every side flip re-broadcasts (a removal plus an upsert), so this
+        // overflows the broadcast buffer regardless of its exact capacity,
+        // without `updates` ever being read.
+        for i in 0..300 {
+            let side = if i % 2 == 0 {
+                proto::Side::Opfor
+            } else {
+                proto::Side::Blufor
+            };
+            cache.upsert_group(a_group("g1", side));
+        }
+
+        let (tx, mut rx) = mpsc::channel(1);
+        forward_group_updates(Vec::new(), 0, None, updates, tx).await;
+
+        let status = match rx.recv().await {
+            Some(Err(status)) => status,
+            other => panic!("expected an aborted response, got {other:?}"),
+        };
+        assert_eq!(status.code(), tonic::Code::Aborted);
     }
 }

@@ -90,9 +90,44 @@ async fn forward_simulation_updates(
                         return;
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                // See services/group.rs's forward_group_updates: a lagged
+                // subscriber is aborted, not silently resynced.
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    let _ = tx
+                        .send(Err(Status::aborted("subscriber lagged; resubscribe")))
+                        .await;
+                    return;
+                }
                 Err(broadcast::error::RecvError::Closed) => return,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// See services/group.rs's matching test: driven directly against an
+    /// already-lagged receiver so it doesn't depend on network backpressure.
+    #[tokio::test]
+    async fn aborts_a_lagged_subscriber() {
+        let cache = StateCache::new();
+        let (_, _, updates) = cache.subscribe_simulation_updates();
+        for i in 0..300 {
+            cache.set_simulation_state(proto::SimulationStateUpdate {
+                simulation_time: i,
+                ..Default::default()
+            });
+        }
+
+        let (tx, mut rx) = mpsc::channel(1);
+        forward_simulation_updates(None, 0, updates, tx).await;
+
+        let status = match rx.recv().await {
+            Some(Err(status)) => status,
+            other => panic!("expected an aborted response, got {other:?}"),
+        };
+        assert_eq!(status.code(), tonic::Code::Aborted);
     }
 }

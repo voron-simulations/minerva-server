@@ -15,7 +15,7 @@
 buf generate
 ```
 
-`buf.gen.yaml`'s `inputs` pins a specific [BSR](https://buf.build/voron-simulations/minerva) commit rather than tracking `main`, so a protocol change only takes effect here once you deliberately bump it. To pick up a new protocol commit: bump the `module:` ref in `buf.gen.yaml`, regenerate, and commit the diff in `src/gen/`.
+`buf.gen.yaml`'s `inputs` tracks the [BSR](https://buf.build/voron-simulations/minerva) `main` label directly (no pinned commit), so a protocol change only takes effect here once someone regenerates and commits the diff -- CI's "No diff" job (`reusable-buf-generate.yml`) runs `buf generate` fresh and fails whenever protocol `main` has moved ahead of the committed `src/gen/`, which is the forcing function to notice and update. To develop against an unpublished protocol change before it's pushed to BSR, pass a local checkout as the input instead of relying on `buf.gen.yaml`: `buf generate ../minerva-protocol`.
 
 ## Testing
 
