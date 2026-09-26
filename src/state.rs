@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use parking_lot::RwLock;
 use tokio::sync::broadcast;
@@ -7,9 +7,20 @@ use crate::ids::{GroupId, UnitId};
 use crate::proto;
 
 /// Number of buffered messages per update stream before a slow subscriber
-/// starts missing them. Subscribers that lag skip forward to the latest
-/// state rather than blocking writers or buffering unboundedly.
-const BROADCAST_CAPACITY: usize = 64;
+/// starts missing them. A subscriber that lags is aborted rather than
+/// silently skipped, since the server can no longer tell it how much it
+/// missed -- so this bounds how much a brief stall costs it (a resubscribe),
+/// not whether it stays correct.
+///
+/// Sized off `benches/state.rs`'s `state_cache_group_updates_fanout`: an
+/// unstaggered 50-group/12-unit-each tick (every group changed, so every one
+/// broadcasts -- the worst case, since Arma actually staggers pushes across
+/// the second) is ~50 events and completes in low single-digit milliseconds
+/// even with 64 concurrently draining subscribers. 256 covers several such
+/// ticks of complete stall -- roughly a couple of seconds of the slowest
+/// subscriber not being polled at all -- before it's aborted instead of
+/// silently missing data.
+const BROADCAST_CAPACITY: usize = 256;
 
 /// A broadcast group update, tagged with the cache's sequence number as of
 /// the write that produced it. Internal only (never serialized) -- it's how
@@ -32,6 +43,13 @@ pub(crate) struct SimulationEvent {
 struct Inner {
     units: HashMap<UnitId, proto::Unit>,
     groups: HashMap<GroupId, proto::Group>,
+    /// Which units currently belong to each group. Derived from `units`'
+    /// `group_id` field and kept in sync on every write that touches
+    /// membership -- it can always be rebuilt by scanning `units`, so it
+    /// can't disagree with them, only fall behind if a write forgets to
+    /// update it (every write below does). A `BTreeSet` so a join iterates
+    /// in a deterministic (id-sorted) order.
+    members: HashMap<GroupId, BTreeSet<UnitId>>,
     simulation_info: Option<proto::SimulationInfo>,
     simulation_state: Option<proto::SimulationStateUpdate>,
     locations: Vec<proto::Location>,
@@ -45,16 +63,46 @@ impl Inner {
         self.sequence += 1;
         self.sequence
     }
+
+    /// The group's stored fields joined with its current members, or `None`
+    /// if the group isn't cached (regardless of whether it has members).
+    fn joined_group(&self, id: &GroupId) -> Option<proto::Group> {
+        let mut group = self.groups.get(id)?.clone();
+        group.units = self.member_units(id);
+        Some(group)
+    }
+
+    fn member_units(&self, id: &GroupId) -> Vec<proto::Unit> {
+        self.members
+            .get(id)
+            .into_iter()
+            .flatten()
+            .filter_map(|unit_id| self.units.get(unit_id))
+            .cloned()
+            .collect()
+    }
+
+    /// Detaches `unit_id` from `group_id`'s member set, dropping the set
+    /// entirely once it's empty so an emptied-out group doesn't leak a
+    /// forever-empty entry.
+    fn unlink_member(&mut self, group_id: &GroupId, unit_id: &UnitId) {
+        if let Some(members) = self.members.get_mut(group_id) {
+            members.remove(unit_id);
+            if members.is_empty() {
+                self.members.remove(group_id);
+            }
+        }
+    }
 }
 
 /// Normalized, in-memory snapshot of simulation state, fed by the engine
 /// thread and read by the gRPC services. `Unit.group_id` is the only place
-/// group membership is recorded — there is no separate group -> units index
-/// to keep in sync, so membership can never disagree with itself.
+/// group membership is recorded; `Inner::members` is a derived index over
+/// it, kept in sync by every write below, not a second source of truth.
 ///
 /// Every broadcast is sent while still holding the write lock that produced
 /// it (`broadcast::Sender::send` never blocks or runs foreign code), so
-/// subscribers see events in exactly the order their mutations committed —
+/// subscribers see events in exactly the order their mutations committed --
 /// e.g. a `clear()` removal can't overtake a concurrent re-upsert.
 pub struct StateCache {
     inner: RwLock<Inner>,
@@ -81,48 +129,194 @@ impl StateCache {
 
     // --- writes (engine thread) ---
 
+    /// Upserts a single unit without otherwise touching group membership.
+    /// Re-broadcasts its (new) group, and its previous group if this moved
+    /// it away from one, since both groups' joined views just changed.
     pub fn upsert_unit(&self, unit: proto::Unit) {
-        let id = UnitId::from(unit.id.clone());
-        self.inner.write().units.insert(id, unit);
+        let mut inner = self.inner.write();
+        let id = UnitId::from(unit.id.as_str());
+        let new_group = GroupId::from(unit.group_id.as_str());
+        let old_group = inner
+            .units
+            .get(&id)
+            .map(|existing| GroupId::from(existing.group_id.as_str()));
+
+        let before_new = inner.joined_group(&new_group);
+        let before_old = old_group
+            .as_ref()
+            .filter(|old| **old != new_group)
+            .map(|old| (old.clone(), inner.joined_group(old)));
+
+        if let Some((old, _)) = &before_old {
+            inner.unlink_member(old, &id);
+        }
+        inner
+            .members
+            .entry(new_group.clone())
+            .or_default()
+            .insert(id.clone());
+        inner.units.insert(id, unit);
+
+        self.emit_if_changed(&mut inner, &new_group, before_new);
+        if let Some((old, before)) = before_old {
+            self.emit_if_changed(&mut inner, &old, before);
+        }
     }
 
+    /// Removes a unit and re-broadcasts the group it belonged to, since its
+    /// joined view just lost a member.
     pub fn remove_unit(&self, id: &UnitId) -> Option<proto::Unit> {
-        self.inner.write().units.remove(id)
+        let mut inner = self.inner.write();
+        let removed = inner.units.remove(id);
+        if let Some(unit) = &removed {
+            let group_id = GroupId::from(unit.group_id.as_str());
+            let before = inner.joined_group(&group_id);
+            inner.unlink_member(&group_id, id);
+            self.emit_if_changed(&mut inner, &group_id, before);
+        }
+        removed
     }
 
+    /// Upserts a group's own fields (side/readiness/task/waypoints) without
+    /// touching its membership. `group.units` is ignored -- use
+    /// [`Self::upsert_group_with_units`] to update both together.
+    ///
     /// If `group` changes side relative to what was cached, first broadcasts
     /// a removal for the old id: a subscriber filtered to the old side has
     /// no other way to learn this group no longer matches its filter.
-    pub fn upsert_group(&self, group: proto::Group) {
-        let id = GroupId::from(group.id.clone());
+    pub fn upsert_group(&self, mut group: proto::Group) {
+        group.units = Vec::new();
         let mut inner = self.inner.write();
-        let previous_side = inner.groups.get(&id).map(|g| g.side);
-        inner.groups.insert(id, group.clone());
+        let id = GroupId::from(group.id.as_str());
+        let before = inner.joined_group(&id);
+        self.replace_group_fields(&mut inner, &id, group);
+        self.emit_if_changed(&mut inner, &id, before);
+    }
+
+    /// Upserts a group's fields and atomically replaces its member set: any
+    /// unit previously in this group but not in `units` is dropped, and a
+    /// unit listed here that belonged to a different group is moved. Each
+    /// unit's `group_id` is set to `group.id` regardless of what it arrived
+    /// with -- the server, not the caller, decides membership for a unit
+    /// embedded in a group's upsert.
+    ///
+    /// Broadcasts every group whose joined view changed: this group, plus
+    /// any other group that lost a member to it.
+    pub fn upsert_group_with_units(&self, mut group: proto::Group, mut units: Vec<proto::Unit>) {
+        group.units = Vec::new();
+        let mut inner = self.inner.write();
+        let group_id = GroupId::from(group.id.as_str());
+        for unit in &mut units {
+            unit.group_id = group_id.to_string();
+        }
+        let new_ids: BTreeSet<UnitId> = units
+            .iter()
+            .map(|unit| UnitId::from(unit.id.as_str()))
+            .collect();
+
+        // Snapshot every other group that will lose a member reassigned
+        // here, before any mutation, so it can be compared after.
+        let mut other_before: HashMap<GroupId, Option<proto::Group>> = HashMap::new();
+        for unit in &units {
+            let id = UnitId::from(unit.id.as_str());
+            if let Some(existing) = inner.units.get(&id) {
+                let previous_group = GroupId::from(existing.group_id.as_str());
+                if previous_group != group_id {
+                    other_before
+                        .entry(previous_group.clone())
+                        .or_insert_with(|| inner.joined_group(&previous_group));
+                }
+            }
+        }
+        let before = inner.joined_group(&group_id);
+
+        // Drop members no longer listed.
+        let old_ids = inner.members.get(&group_id).cloned().unwrap_or_default();
+        for id in old_ids.difference(&new_ids) {
+            inner.units.remove(id);
+        }
+
+        // Detach every listed unit from wherever it used to belong (if
+        // different) before relinking it here.
+        for unit in &units {
+            let id = UnitId::from(unit.id.as_str());
+            if let Some(existing) = inner.units.get(&id) {
+                let previous_group = GroupId::from(existing.group_id.as_str());
+                if previous_group != group_id {
+                    inner.unlink_member(&previous_group, &id);
+                }
+            }
+        }
+
+        inner.members.insert(group_id.clone(), new_ids);
+        for unit in units {
+            inner.units.insert(UnitId::from(unit.id.as_str()), unit);
+        }
+
+        self.replace_group_fields(&mut inner, &group_id, group);
+
+        self.emit_if_changed(&mut inner, &group_id, before);
+        for (other_id, before) in other_before {
+            self.emit_if_changed(&mut inner, &other_id, before);
+        }
+    }
+
+    /// Replaces a group's stored (unit-less) fields, broadcasting a removal
+    /// first if this changed its side. Shared by [`Self::upsert_group`] and
+    /// [`Self::upsert_group_with_units`]; doesn't broadcast the upsert
+    /// itself -- callers do that via [`Self::emit_if_changed`] once their
+    /// own membership changes are also applied.
+    fn replace_group_fields(&self, inner: &mut Inner, id: &GroupId, group: proto::Group) {
+        let previous_side = inner.groups.get(id).map(|existing| existing.side);
+        inner.groups.insert(id.clone(), group.clone());
         if previous_side.is_some_and(|previous| previous != group.side) {
             let removal = GroupEvent {
                 sequence: inner.next_sequence(),
-                response: group_removed(group.id.clone()),
+                response: group_removed(group.id),
             };
-            // No subscribers is the common case (e.g. no client connected yet); ignore it.
             let _ = self.group_updates.send(removal);
         }
-        let upsert = GroupEvent {
-            sequence: inner.next_sequence(),
-            response: group_upserted(group),
-        };
-        let _ = self.group_updates.send(upsert);
     }
 
+    /// Sends a `GroupEvent` for `id` if its joined value now differs from
+    /// `before` (its value just prior to the write in progress). `inner`
+    /// must already reflect that write.
+    fn emit_if_changed(&self, inner: &mut Inner, id: &GroupId, before: Option<proto::Group>) {
+        let after = inner.joined_group(id);
+        if after == before {
+            return;
+        }
+        let response = match after {
+            Some(group) => group_upserted(group),
+            None => group_removed(id.to_string()),
+        };
+        let event = GroupEvent {
+            sequence: inner.next_sequence(),
+            response,
+        };
+        let _ = self.group_updates.send(event);
+    }
+
+    /// Removes a group and every unit that belonged to it, broadcasting a
+    /// single removal. Returns the group as it was just before removal
+    /// (including its units), or `None` if it wasn't cached.
     pub fn remove_group(&self, id: &GroupId) -> Option<proto::Group> {
         let mut inner = self.inner.write();
-        let removed = inner.groups.remove(id);
-        if removed.is_some() {
-            let event = GroupEvent {
-                sequence: inner.next_sequence(),
-                response: group_removed(id.to_string()),
-            };
-            let _ = self.group_updates.send(event);
+        if !inner.groups.contains_key(id) {
+            return None;
         }
+        let removed = inner.joined_group(id);
+        inner.groups.remove(id);
+        if let Some(members) = inner.members.remove(id) {
+            for unit_id in members {
+                inner.units.remove(&unit_id);
+            }
+        }
+        let event = GroupEvent {
+            sequence: inner.next_sequence(),
+            response: group_removed(id.to_string()),
+        };
+        let _ = self.group_updates.send(event);
         removed
     }
 
@@ -202,16 +396,22 @@ impl StateCache {
     }
 
     pub fn get_group(&self, id: &GroupId) -> Option<proto::Group> {
-        self.inner.read().groups.get(id).cloned()
+        self.inner.read().joined_group(id)
     }
 
     pub fn list_groups(&self, side: Option<proto::Side>) -> Vec<proto::Group> {
-        self.inner
-            .read()
+        let inner = self.inner.read();
+        inner
             .groups
-            .values()
-            .filter(|group| side.is_none_or(|side| proto::Side::try_from(group.side) == Ok(side)))
-            .cloned()
+            .iter()
+            .filter(|(_, group)| {
+                side.is_none_or(|side| proto::Side::try_from(group.side) == Ok(side))
+            })
+            .map(|(id, group)| {
+                let mut group = group.clone();
+                group.units = inner.member_units(id);
+                group
+            })
             .collect()
     }
 
@@ -259,9 +459,9 @@ impl StateCache {
         (inner.simulation_state, inner.sequence, receiver)
     }
 
-    /// Returns the groups currently matching `side`, the sequence number
-    /// that snapshot was taken at, and a receiver for updates from this
-    /// point on.
+    /// Returns the groups (joined with their units) currently matching
+    /// `side`, the sequence number that snapshot was taken at, and a
+    /// receiver for updates from this point on.
     pub(crate) fn subscribe_group_updates(
         &self,
         side: Option<proto::Side>,
@@ -270,9 +470,15 @@ impl StateCache {
         let inner = self.inner.read();
         let groups = inner
             .groups
-            .values()
-            .filter(|group| side.is_none_or(|side| proto::Side::try_from(group.side) == Ok(side)))
-            .cloned()
+            .iter()
+            .filter(|(_, group)| {
+                side.is_none_or(|side| proto::Side::try_from(group.side) == Ok(side))
+            })
+            .map(|(id, group)| {
+                let mut group = group.clone();
+                group.units = inner.member_units(id);
+                group
+            })
             .collect();
         (groups, inner.sequence, receiver)
     }
@@ -315,7 +521,12 @@ mod tests {
             readiness: None,
             has_task: false,
             waypoints: Vec::new(),
+            units: Vec::new(),
         }
+    }
+
+    fn unit_ids(group: &proto::Group) -> Vec<&str> {
+        group.units.iter().map(|unit| unit.id.as_str()).collect()
     }
 
     #[test]
@@ -400,302 +611,98 @@ mod tests {
     }
 
     #[test]
-    fn simulation_info_and_state_round_trip() {
+    fn remove_group_drops_its_units() {
         let cache = StateCache::new();
-        assert_eq!(cache.simulation_info(), None);
-        assert_eq!(cache.simulation_state(), None);
-
-        let info = proto::SimulationInfo {
-            world_name: "Altis".to_string(),
-            ..Default::default()
-        };
-        cache.set_simulation_info(info.clone());
-        assert_eq!(cache.simulation_info(), Some(info));
-
-        let state = proto::SimulationStateUpdate {
-            simulation_time: 42,
-            ..Default::default()
-        };
-        cache.set_simulation_state(state);
-        assert_eq!(cache.simulation_state(), Some(state));
-    }
-
-    #[test]
-    fn locations_filter_by_owner_side() {
-        let cache = StateCache::new();
-        cache.set_locations(vec![
-            proto::Location {
-                id: "l1".to_string(),
-                owner: proto::Side::Blufor as i32,
-                ..Default::default()
-            },
-            proto::Location {
-                id: "l2".to_string(),
-                owner: proto::Side::Opfor as i32,
-                ..Default::default()
-            },
-        ]);
-
-        let blufor = cache.list_locations(Some(proto::Side::Blufor));
-        assert_eq!(
-            blufor.iter().map(|l| l.id.as_str()).collect::<Vec<_>>(),
-            vec!["l1"]
-        );
-        assert_eq!(cache.list_locations(None).len(), 2);
-    }
-
-    #[test]
-    fn clear_drops_everything() {
-        let cache = StateCache::new();
-        cache.upsert_unit(unit("u1", "g1"));
-        cache.upsert_group(group("g1", proto::Side::Blufor));
-        cache.set_simulation_info(proto::SimulationInfo::default());
-        cache.set_locations(vec![proto::Location::default()]);
-
-        cache.clear();
-
+        cache.upsert_group_with_units(group("g1", proto::Side::Blufor), vec![unit("u1", "g1")]);
+        let removed = cache.remove_group(&GroupId::from("g1")).expect("cached");
+        assert_eq!(unit_ids(&removed), vec!["u1"]);
+        assert_eq!(cache.get_unit(&UnitId::from("u1")), None);
         assert_eq!(cache.list_units(None, None).len(), 0);
-        assert_eq!(cache.list_groups(None).len(), 0);
-        assert_eq!(cache.simulation_info(), None);
-        assert_eq!(cache.list_locations(None).len(), 0);
     }
 
-    fn upserted_id(response: proto::SubscribeGroupUpdatesResponse) -> Option<String> {
-        match response.event {
-            Some(proto::subscribe_group_updates_response::Event::Upserted(group)) => Some(group.id),
-            _ => None,
-        }
-    }
-
-    fn removed_id(response: proto::SubscribeGroupUpdatesResponse) -> Option<String> {
-        match response.event {
-            Some(proto::subscribe_group_updates_response::Event::RemovedId(id)) => Some(id),
-            _ => None,
-        }
-    }
-
-    async fn recv_group(
-        rx: &mut broadcast::Receiver<GroupEvent>,
-    ) -> proto::SubscribeGroupUpdatesResponse {
-        match rx.recv().await {
-            Ok(event) => event.response,
-            Err(err) => panic!("channel closed unexpectedly: {err}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn subscribe_group_updates_receives_upsert() {
+    #[test]
+    fn upsert_group_with_units_joins_units_in_reads() {
         let cache = StateCache::new();
-        let (_, _, mut rx) = cache.subscribe_group_updates(None);
-        cache.upsert_group(group("g1", proto::Side::Blufor));
-        assert_eq!(
-            upserted_id(recv_group(&mut rx).await),
-            Some("g1".to_string())
+        cache.upsert_group_with_units(
+            group("g1", proto::Side::Blufor),
+            vec![unit("u1", "g1"), unit("u2", "g1")],
         );
+
+        let group = cache.get_group(&GroupId::from("g1")).expect("cached");
+        assert_eq!(unit_ids(&group), vec!["u1", "u2"]);
+
+        let listed = cache.list_groups(None);
+        assert_eq!(unit_ids(&listed[0]), vec!["u1", "u2"]);
     }
 
-    #[tokio::test]
-    async fn subscribe_group_updates_returns_current_snapshot() {
+    #[test]
+    fn upsert_group_with_units_drops_members_not_listed() {
         let cache = StateCache::new();
-        cache.upsert_group(group("g1", proto::Side::Blufor));
-        let (snapshot, _, _rx) = cache.subscribe_group_updates(None);
-        assert_eq!(
-            snapshot.iter().map(|g| g.id.as_str()).collect::<Vec<_>>(),
-            vec!["g1"]
+        cache.upsert_group_with_units(
+            group("g1", proto::Side::Blufor),
+            vec![unit("u1", "g1"), unit("u2", "g1")],
         );
+        cache.upsert_group_with_units(group("g1", proto::Side::Blufor), vec![unit("u1", "g1")]);
+
+        let group = cache.get_group(&GroupId::from("g1")).expect("cached");
+        assert_eq!(unit_ids(&group), vec!["u1"]);
+        // The dropped member is gone entirely, not just detached.
+        assert_eq!(cache.get_unit(&UnitId::from("u2")), None);
     }
 
-    #[tokio::test]
-    async fn subscribe_group_updates_skips_events_already_in_the_snapshot() {
+    #[test]
+    fn upsert_group_with_units_moves_a_unit_from_another_group() {
         let cache = StateCache::new();
+        cache.upsert_group_with_units(group("g1", proto::Side::Blufor), vec![unit("u1", "g1")]);
+        cache.upsert_group_with_units(group("g2", proto::Side::Blufor), vec![unit("u1", "g2")]);
+
+        let g1 = cache.get_group(&GroupId::from("g1")).expect("cached");
+        let g2 = cache.get_group(&GroupId::from("g2")).expect("cached");
+        assert_eq!(unit_ids(&g1), Vec::<&str>::new());
+        assert_eq!(unit_ids(&g2), vec!["u1"]);
+        assert_eq!(cache.get_unit(&UnitId::from("u1")).unwrap().group_id, "g2");
+    }
+
+    #[test]
+    fn upsert_group_with_units_forces_the_units_group_id() {
+        let cache = StateCache::new();
+        // A unit claiming a different group_id than the one it's embedded
+        // in is corrected, not trusted.
+        cache.upsert_group_with_units(group("g1", proto::Side::Blufor), vec![unit("u1", "bogus")]);
+        assert_eq!(cache.get_unit(&UnitId::from("u1")).unwrap().group_id, "g1");
+    }
+
+    #[test]
+    fn upsert_group_with_units_is_a_noop_on_unchanged_input() {
+        let cache = StateCache::new();
+        let (_, sequence_before, _) = cache.subscribe_group_updates(None);
+        cache.upsert_group_with_units(group("g1", proto::Side::Blufor), vec![unit("u1", "g1")]);
+        let (_, sequence_after_first, _) = cache.subscribe_group_updates(None);
+        assert!(sequence_after_first > sequence_before);
+
+        cache.upsert_group_with_units(group("g1", proto::Side::Blufor), vec![unit("u1", "g1")]);
+        let (_, sequence_after_repeat, _) = cache.subscribe_group_updates(None);
+        assert_eq!(sequence_after_repeat, sequence_after_first);
+    }
+
+    #[test]
+    fn side_change_still_emits_removal_then_upsert() {
+        let cache = StateCache::new();
+        let mut receiver = cache.subscribe_group_updates(None).2;
         cache.upsert_group(group("g1", proto::Side::Blufor));
-        let (_, sequence, mut rx) = cache.subscribe_group_updates(None);
-        // Simulates the race the sequence number exists to close: an update
-        // that happened before the snapshot was read, but is still sitting
-        // in the receiver's buffer (subscribe happened first, per the
-        // ordering above).
-        cache.upsert_group(group("g2", proto::Side::Blufor));
-        let stale = match rx.recv().await {
-            Ok(event) => event,
-            Err(err) => panic!("channel closed unexpectedly: {err}"),
-        };
-        assert!(
-            stale.sequence > sequence,
-            "test setup: event should be newer than the snapshot"
-        );
-        // The service layer is what actually filters on `.sequence` (see
-        // services/group.rs); this just proves the number itself is usable
-        // for that: strictly increasing, and available before/after a send.
-    }
-
-    #[tokio::test]
-    async fn remove_group_broadcasts_removal() {
-        let cache = StateCache::new();
-        cache.upsert_group(group("g1", proto::Side::Blufor));
-        let (_, _, mut rx) = cache.subscribe_group_updates(None);
-        cache.remove_group(&GroupId::from("g1"));
-        assert_eq!(
-            removed_id(recv_group(&mut rx).await),
-            Some("g1".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn remove_unknown_group_does_not_broadcast() {
-        let cache = StateCache::new();
-        let (_, _, mut rx) = cache.subscribe_group_updates(None);
-        assert_eq!(cache.remove_group(&GroupId::from("missing")), None);
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn upsert_group_broadcasts_removal_before_upsert_on_side_change() {
-        let cache = StateCache::new();
-        cache.upsert_group(group("g1", proto::Side::Blufor));
-        let (_, _, mut rx) = cache.subscribe_group_updates(None);
-
         cache.upsert_group(group("g1", proto::Side::Opfor));
 
-        assert_eq!(
-            removed_id(recv_group(&mut rx).await),
-            Some("g1".to_string())
-        );
-        assert_eq!(
-            upserted_id(recv_group(&mut rx).await),
-            Some("g1".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn upsert_group_does_not_broadcast_removal_when_side_is_unchanged() {
-        let cache = StateCache::new();
-        cache.upsert_group(group("g1", proto::Side::Blufor));
-        let (_, _, mut rx) = cache.subscribe_group_updates(None);
-
-        cache.upsert_group(group("g1", proto::Side::Blufor));
-
-        assert_eq!(
-            upserted_id(recv_group(&mut rx).await),
-            Some("g1".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn clear_broadcasts_removal_for_every_group() {
-        let cache = StateCache::new();
-        cache.upsert_group(group("g1", proto::Side::Blufor));
-        cache.upsert_group(group("g2", proto::Side::Opfor));
-        let (_, _, mut rx) = cache.subscribe_group_updates(None);
-
-        cache.clear();
-
-        let mut removed = vec![
-            removed_id(recv_group(&mut rx).await),
-            removed_id(recv_group(&mut rx).await),
-        ];
-        removed.sort();
-        assert_eq!(
-            removed,
-            vec![Some("g1".to_string()), Some("g2".to_string())]
-        );
-    }
-
-    #[tokio::test]
-    async fn clear_events_are_newer_than_prior_snapshots() {
-        let cache = StateCache::new();
-        cache.upsert_group(group("g1", proto::Side::Blufor));
-        cache.set_simulation_state(proto::SimulationStateUpdate::default());
-        let (_, group_sequence, mut group_rx) = cache.subscribe_group_updates(None);
-        let (_, sim_sequence, mut sim_rx) = cache.subscribe_simulation_updates();
-
-        cache.clear();
-
-        let removal = match group_rx.recv().await {
-            Ok(event) => event,
-            Err(err) => panic!("channel closed unexpectedly: {err}"),
-        };
-        assert!(removal.sequence > group_sequence);
-        let reset = match sim_rx.recv().await {
-            Ok(event) => event,
-            Err(err) => panic!("channel closed unexpectedly: {err}"),
-        };
-        assert!(reset.sequence > sim_sequence);
-
-        cache.upsert_group(group("g2", proto::Side::Blufor));
-        let upsert = match group_rx.recv().await {
-            Ok(event) => event,
-            Err(err) => panic!("channel closed unexpectedly: {err}"),
-        };
-        assert!(upsert.sequence > removal.sequence);
-    }
-
-    #[tokio::test]
-    async fn concurrent_writes_broadcast_in_sequence_order() {
-        let cache = std::sync::Arc::new(StateCache::new());
-        let (_, _, mut rx) = cache.subscribe_group_updates(None);
-        let writers: Vec<_> = (0..4)
-            .map(|t| {
-                let cache = cache.clone();
-                std::thread::spawn(move || {
-                    for i in 0..10 {
-                        cache.upsert_group(group(&format!("g{t}-{i}"), proto::Side::Blufor));
-                    }
-                })
-            })
-            .collect();
-        for writer in writers {
-            writer.join().expect("writer thread panicked");
+        use proto::subscribe_group_updates_response::Event;
+        let first = receiver.try_recv().expect("upsert").response.event;
+        let second = receiver.try_recv().expect("removal").response.event;
+        let third = receiver.try_recv().expect("upsert").response.event;
+        assert!(matches!(first, Some(Event::Upserted(_))));
+        assert!(matches!(second, Some(Event::RemovedId(_))));
+        match third {
+            Some(Event::Upserted(group)) => {
+                assert_eq!(proto::Side::try_from(group.side), Ok(proto::Side::Opfor))
+            }
+            other => panic!("expected an upsert, got {other:?}"),
         }
-
-        let mut last = 0;
-        while let Ok(event) = rx.try_recv() {
-            assert!(event.sequence > last, "broadcast out of mutation order");
-            last = event.sequence;
-        }
-        assert_eq!(last, 40);
-    }
-
-    #[tokio::test]
-    async fn subscribe_simulation_updates_receives_state() {
-        let cache = StateCache::new();
-        let (_, _, mut rx) = cache.subscribe_simulation_updates();
-        cache.set_simulation_state(proto::SimulationStateUpdate {
-            simulation_time: 7,
-            ..Default::default()
-        });
-        let event = match rx.recv().await {
-            Ok(event) => event,
-            Err(err) => panic!("channel closed unexpectedly: {err}"),
-        };
-        assert_eq!(event.response.state.map(|s| s.simulation_time), Some(7));
-    }
-
-    #[tokio::test]
-    async fn subscribe_simulation_updates_returns_current_snapshot() {
-        let cache = StateCache::new();
-        cache.set_simulation_state(proto::SimulationStateUpdate {
-            simulation_time: 5,
-            ..Default::default()
-        });
-        let (snapshot, _, _rx) = cache.subscribe_simulation_updates();
-        assert_eq!(snapshot.map(|s| s.simulation_time), Some(5));
-    }
-
-    #[tokio::test]
-    async fn clear_broadcasts_simulation_reset() {
-        let cache = StateCache::new();
-        cache.set_simulation_state(proto::SimulationStateUpdate {
-            simulation_time: 9,
-            ..Default::default()
-        });
-        let (_, _, mut rx) = cache.subscribe_simulation_updates();
-
-        cache.clear();
-
-        let event = match rx.recv().await {
-            Ok(event) => event,
-            Err(err) => panic!("channel closed unexpectedly: {err}"),
-        };
-        assert_eq!(event.response.state, None);
     }
 }

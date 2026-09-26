@@ -17,20 +17,20 @@ use crate::proto;
 pub enum Command {
     Move {
         group_id: GroupId,
-        position: proto::Position,
+        position: proto::CommandTarget,
     },
     SearchAndDestroy {
         group_id: GroupId,
-        position: proto::Position,
+        position: proto::CommandTarget,
     },
     DefendZone {
         group_id: GroupId,
         zone_id: String,
-        position: Option<proto::Position>,
+        position: Option<proto::CommandTarget>,
     },
     Patrol {
         group_id: GroupId,
-        waypoints: Vec<proto::Position>,
+        waypoints: Vec<proto::CommandTarget>,
         loop_: bool,
     },
     Support {
@@ -59,7 +59,7 @@ impl Command {
     pub fn from_proto(request: proto::SendCommandRequest) -> Result<Self, Status> {
         use proto::send_command_request::Command as Oneof;
 
-        let require_position = |position: Option<proto::Position>| {
+        let require_position = |position: Option<proto::CommandTarget>| {
             position.ok_or_else(|| Status::invalid_argument("position is required"))
         };
         let require_group_id = |group_id: String| -> Result<GroupId, Status> {
@@ -239,7 +239,7 @@ mod tests {
     fn move_command(group_id: &str) -> Command {
         Command::Move {
             group_id: GroupId::from(group_id),
-            position: proto::Position::default(),
+            position: proto::CommandTarget::default(),
         }
     }
 
@@ -268,7 +268,7 @@ mod tests {
     fn from_proto_rejects_empty_group_id() {
         let request = oneof(proto::send_command_request::Command::Move(
             proto::MoveCommand {
-                position: Some(proto::Position::default()),
+                position: Some(proto::CommandTarget::default()),
                 group_id: String::new(),
             },
         ));
@@ -326,10 +326,10 @@ mod tests {
     fn from_proto_accepts_valid_move() {
         let request = oneof(proto::send_command_request::Command::Move(
             proto::MoveCommand {
-                position: Some(proto::Position {
+                position: Some(proto::CommandTarget {
                     x: 1.0,
                     y: 2.0,
-                    z: 3.0,
+                    z: Some(3.0),
                 }),
                 group_id: "g1".to_string(),
             },
