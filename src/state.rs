@@ -167,10 +167,18 @@ impl StateCache {
     /// joined view just lost a member.
     pub fn remove_unit(&self, id: &UnitId) -> Option<proto::Unit> {
         let mut inner = self.inner.write();
+        // `before` must be captured while the unit is still in `units`:
+        // `joined_group` derives membership from that map, so computing it
+        // after removal would already reflect the unit gone on both sides
+        // of the comparison, and emit_if_changed would see no change and
+        // never tell subscribers it left.
+        let group_id = inner
+            .units
+            .get(id)
+            .map(|unit| GroupId::from(unit.group_id.as_str()));
+        let before = group_id.as_ref().and_then(|id| inner.joined_group(id));
         let removed = inner.units.remove(id);
-        if let Some(unit) = &removed {
-            let group_id = GroupId::from(unit.group_id.as_str());
-            let before = inner.joined_group(&group_id);
+        if let Some(group_id) = group_id {
             inner.unlink_member(&group_id, id);
             self.emit_if_changed(&mut inner, &group_id, before);
         }
@@ -547,6 +555,27 @@ mod tests {
         assert!(cache.remove_unit(&UnitId::from("u1")).is_some());
         assert_eq!(cache.get_unit(&UnitId::from("u1")), None);
         assert_eq!(cache.remove_unit(&UnitId::from("u1")), None);
+    }
+
+    #[test]
+    fn remove_unit_broadcasts_its_group_without_it() {
+        let cache = StateCache::new();
+        cache.upsert_group_with_units(group("g1", proto::Side::Blufor), vec![unit("u1", "g1")]);
+        // Subscribing after the setup upsert above: only the snapshot
+        // Vec (unused here) reflects it, so the receiver starts empty.
+        let mut receiver = cache.subscribe_group_updates(None).2;
+
+        cache.remove_unit(&UnitId::from("u1"));
+
+        let event = receiver
+            .try_recv()
+            .expect("remove_unit must re-broadcast its group");
+        match event.response.event {
+            Some(proto::subscribe_group_updates_response::Event::Upserted(group)) => {
+                assert_eq!(unit_ids(&group), Vec::<&str>::new());
+            }
+            other => panic!("expected an upsert with the unit gone, got {other:?}"),
+        }
     }
 
     #[test]
